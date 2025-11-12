@@ -1,3 +1,20 @@
+# 网站：[https://ai.t8star.cn](https://ai.t8star.cn/register?aff=dP7j)
+# 在线工作流：https://www.runninghub.ai/?inviteCode=rh-v1121
+
+# 👋🏻 Welcome to Zhenzhen
+
+<img src="https://github.com/T8mars/Comfyui-zhenzhen/blob/main/pic/1.png" width="30%" alt="My favorite girl">
+My favorite girl
+
+# Update
+
+20251027:
+
+更新支持破限版模型：huihui-ai/Huihui-Qwen3-VL-8B-Instruct-abliterated
+支持NSFW
+模型下载地址：https://hf-mirror.com/huihui-ai/Huihui-Qwen3-VL-8B-Instruct-abliterated
+网盘地址：https://pan.quark.cn/s/3c8a51a41dd4
+
 # Comfyui_Qwen3-VL-Instruct
 
 This is an implementation of [Qwen3-VL-Instruct](https://github.com/QwenLM/Qwen3-VL) by [ComfyUI](https://github.com/comfyanonymous/ComfyUI), which includes, but is not limited to, support for text-based queries, video queries, single-image queries, and multi-image queries to generate captions or responses.
