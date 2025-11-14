@@ -13,7 +13,8 @@ from pathlib import Path
 import json
 
 
-class Qwen3_VQA:
+class Qwen3_Base:
+    """Qwen3节点的基类，包含通用的缓存功能"""
     def __init__(self):
         self.model_checkpoint = None
         self.processor = None
@@ -26,6 +27,45 @@ class Qwen3_VQA:
         self.current_model_id = None  # Track the current model id
         self.current_quantization = None  # Track the current quantization
         self.cache = {}  # 用于存储输入参数和模型输出的缓存
+        self.max_cache_size = 100  # 最大缓存条目数
+        self.cache_enabled = True  # 缓存开关
+        print(f"[{self.__class__.__name__}] 节点初始化完成，缓存系统已设置")
+    
+    # _create_cache_key方法已移至基类Qwen3_Base中实现
+    
+    def generate_cache_key_without_random_seed(self, seed, **kwargs):
+        """生成缓存键，当seed=-1时不包含在缓存键中"""
+        cache_params = dict(kwargs)
+        # 只有当seed不是-1时才将其包含在缓存键中
+        if seed != -1:
+            cache_params['seed'] = seed
+        
+        return self._create_cache_key(**cache_params)
+    
+    def check_cache(self, cache_key, use_cache=True):
+        """检查缓存是否存在并返回结果"""
+        if use_cache and self.cache_enabled and cache_key in self.cache:
+            print(f"[{self.__class__.__name__}] 缓存命中! 使用缓存结果。")
+            return self.cache[cache_key]
+        if use_cache and self.cache_enabled:
+            print(f"[{self.__class__.__name__}] 缓存未命中，将请求模型。")
+        return None
+    
+    def update_cache(self, cache_key, result, use_cache=True):
+        """更新缓存"""
+        if use_cache and self.cache_enabled:
+            self.cache[cache_key] = result
+            print(f"[{self.__class__.__name__}] 结果已缓存。当前缓存大小: {len(self.cache)}/{self.max_cache_size}")
+            # 限制缓存大小
+            if len(self.cache) > self.max_cache_size:
+                # 删除最早添加的项目
+                self.cache.pop(next(iter(self.cache)))
+                print(f"[{self.__class__.__name__}] 缓存已满，已删除最早的缓存项。")
+
+
+class Qwen3_VQA(Qwen3_Base):
+    def __init__(self):
+        super().__init__()  # 调用基类的初始化方法
         print("[Qwen3_VQA] 节点初始化完成，缓存系统已设置")
 
     @classmethod
@@ -111,15 +151,15 @@ class Qwen3_VQA:
             attention="eager",
             use_cache=True,
     ):
-        # 创建缓存键
-        cache_key = self._create_cache_key(
+        # 使用基类的缓存键生成方法
+        cache_key = self.generate_cache_key_without_random_seed(
+            seed=seed,
             text=text,
             model=model,
             temperature=temperature,
             max_new_tokens=max_new_tokens,
             min_pixels=min_pixels,
             max_pixels=max_pixels,
-            seed=seed,
             quantization=quantization,
             source_path=source_path,
             image=image,
@@ -127,11 +167,9 @@ class Qwen3_VQA:
         )
         
         # 检查是否可以从缓存获取结果
-        if use_cache:
-            print(f"[Qwen3_VQA] 缓存开关已开启，检查是否存在缓存结果")
-            if cache_key in self.cache:
-                print(f"[Qwen3_VQA] 缓存命中！直接返回缓存结果")
-                return (self.cache[cache_key],)
+        cached_result = self.check_cache(cache_key, use_cache)
+        if cached_result is not None:
+            return (cached_result,)
         if seed != -1:
             torch.manual_seed(seed)
         if model == "Huihui-Qwen3-VL-8B-Instruct-abliterated":
@@ -275,73 +313,22 @@ class Qwen3_VQA:
                     torch.cuda.ipc_collect()
 
             # 将结果存入缓存
-            if use_cache:
-                self.cache[cache_key] = result
-                print(f"[Qwen3_VQA] 结果已存入缓存，当前缓存大小: {len(self.cache)}")
+            self.update_cache(cache_key, result, use_cache)
             
             print(f"[Qwen3_VQA] 推理完成")
             return (result,)
     
-    def _create_cache_key(self, **kwargs):
-        """创建缓存键，基于所有输入参数"""
-        key_parts = []
-        for k, v in sorted(kwargs.items()):
-            if v is not None:
-                if isinstance(v, torch.Tensor):
-                    # 对于图像张量，增强缓存键的生成逻辑，添加更多特征信息
-                    try:
-                        # 使用形状、均值、标准差和张量数据的哈希值
-                        # 对于大张量，采样部分数据进行哈希，避免计算开销过大
-                        shape_str = str(v.shape)
-                        mean_val = v.mean().item()
-                        std_val = v.std().item()
-                        
-                        # 采样部分数据计算哈希值（如果张量很大）
-                        if v.numel() > 10000:  # 如果张量元素数量超过10000
-                            # 均匀采样100个点
-                            indices = torch.linspace(0, v.numel() - 1, min(100, v.numel()), dtype=torch.long)
-                            sampled_data = v.view(-1)[indices]
-                            hash_val = hash(str(sampled_data.cpu().numpy().tolist()))
-                        else:
-                            # 对于小张量，使用所有数据的哈希值
-                            hash_val = hash(str(v.cpu().numpy().tolist()))
-                        
-                        key_parts.append(f"{k}:{shape_str}:{mean_val:.4f}:{std_val:.4f}:{hash_val}")
-                    except Exception as e:
-                        # 如果出现异常，降级使用基本信息
-                        print(f"[缓存键生成警告] 处理张量 {k} 时出错: {e}，使用基本信息")
-                        key_parts.append(f"{k}:{v.shape}:{v.mean().item():.4f}:{v.std().item():.4f}")
-                else:
-                    key_parts.append(f"{k}:{v}")
-        
-        # 为了确保缓存键的唯一性和稳定性，添加整体哈希
-        cache_key = "_".join(key_parts)
-        # 如果键太长，使用哈希值缩短
-        if len(cache_key) > 1000:
-            cache_key = f"hash:{hash(cache_key)}"
-            
-        return cache_key
+    # _create_cache_key方法已移至基类Qwen3_Base中实现
 
 
-class Qwen3_VQA_Quick:
+class Qwen3_VQA_Quick(Qwen3_Base):
     def __init__(self):
-        self.model_checkpoint = None
-        self.processor = None
-        self.model = None
-        self.device = comfy.model_management.get_torch_device()
-        self.bf16_support = (
-                torch.cuda.is_available()
-                and torch.cuda.get_device_capability(self.device)[0] >= 8
-        )
-        self.current_model_id = None  # Track the current model id
-        self.current_quantization = None  # Track the current quantization
-        self.cache = {}  # 用于存储输入参数和模型输出的缓存
+        super().__init__()  # 调用基类的初始化方法
         # 提示词模板文件夹路径
         self.prompts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts")
         # 确保提示词文件夹存在
         if not os.path.exists(self.prompts_dir):
             os.makedirs(self.prompts_dir)
-        print("[Qwen3_VQA_Quick] 节点初始化完成，缓存系统已设置")
 
     @classmethod
     def INPUT_TYPES(s):
@@ -503,8 +490,9 @@ class Qwen3_VQA_Quick:
             attention="eager",
             use_cache=True,
     ):
-        # 创建缓存键
-        cache_key = self._create_cache_key(
+        # 使用基类的缓存键生成方法
+        cache_key = self.generate_cache_key_without_random_seed(
+            seed=seed,
             prompt_template=prompt_template,
             user_prompt=user_prompt,
             model=model,
@@ -512,7 +500,6 @@ class Qwen3_VQA_Quick:
             max_new_tokens=max_new_tokens,
             min_pixels=min_pixels,
             max_pixels=max_pixels,
-            seed=seed,
             quantization=quantization,
             source_path=source_path,
             image1=image1,
@@ -521,13 +508,11 @@ class Qwen3_VQA_Quick:
         )
         
         # 检查是否可以从缓存获取结果
-        if use_cache:
-            print(f"[Qwen3_VQA_Quick] 缓存开关已开启，检查是否存在缓存结果")
-            if cache_key in self.cache:
-                print(f"[Qwen3_VQA_Quick] 缓存命中！直接返回缓存结果")
-                result, text = self.cache[cache_key]
-                print(f"[Qwen3_VQA_Quick] 推理完成")
-                return (result, text)
+        cached_result = self.check_cache(cache_key, use_cache)
+        if cached_result is not None:
+            result, text = cached_result
+            print(f"[Qwen3_VQA_Quick] 推理完成")
+            return (result, text)
         
         # 读取提示词模板内容
         template_text = self.read_prompt_template(prompt_template)
@@ -680,9 +665,7 @@ class Qwen3_VQA_Quick:
                 torch.cuda.ipc_collect()
 
         # 将结果存入缓存
-        if use_cache:
-            self.cache[cache_key] = (result, text)
-            print(f"[Qwen3_VQA_Quick] 结果已存入缓存，当前缓存大小: {len(self.cache)}")
+        self.update_cache(cache_key, (result, text), use_cache)
         
         print(f"[Qwen3_VQA_Quick] 推理完成")
         return (result, text)
