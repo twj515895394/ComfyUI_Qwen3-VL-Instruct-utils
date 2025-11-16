@@ -1,6 +1,8 @@
 from .nodes import Qwen3_VQA, Qwen3_VQA_Quick
 from .util_nodes import ImageLoader, VideoLoader, VideoLoaderPath
 from .path_nodes import MultiplePathsInput
+from .text_save_nodes import Qwen3_Text_Save
+from .text_read_nodes import Qwen3_Text_Excel_Reader, Qwen3_Text_Batch_Loader
 
 WEB_DIRECTORY = "./web"
 # A dictionary that contains all nodes you want to export with their names
@@ -12,6 +14,9 @@ NODE_CLASS_MAPPINGS = {
     "Load Video Advanced": VideoLoader,
     "Load Video Advanced (Path)": VideoLoaderPath,
     "Multiple Paths Input": MultiplePathsInput,
+    "Qwen3 Text Save": Qwen3_Text_Save,
+    "Qwen3 Text/Excel Reader": Qwen3_Text_Excel_Reader,
+    "Qwen3 Text Batch Loader": Qwen3_Text_Batch_Loader,
 }
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
@@ -22,4 +27,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Load Video Advanced": "Load Video Advanced",
     "Load Video Advanced (Path)": "Load Video Advanced (Path)",
     "Multiple Paths Input": "Multiple Paths Input",
+    "Qwen3 Text Save": "Qwen3 Text Save",
+    "Qwen3 Text/Excel Reader": "Qwen3 Text/Excel Reader",
+    "Qwen3 Text Batch Loader": "Qwen3 Text Batch Loader",
 }
