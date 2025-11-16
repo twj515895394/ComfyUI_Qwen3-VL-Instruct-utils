@@ -47,6 +47,9 @@ class Qwen3_Text_Save:
             # 处理JSON格式
             if self.is_json_string(text):
                 text = self.format_json_to_line(text)
+            else:
+                # 将普通文本转换为单行，替换所有换行符和回车符为空格
+                text = text.replace('\n', ' ').replace('\r', '').strip()
             
             # 将用户选择的模式映射为Python实际模式字符串
             mode_map = {
@@ -72,6 +75,9 @@ class Qwen3_Text_Save:
             # 处理JSON格式
             if self.is_json_string(text):
                 text = self.format_json_to_line(text)
+            else:
+                # 将普通文本转换为单行，替换所有换行符和回车符为空格
+                text = text.replace('\n', ' ').replace('\r', '').strip()
             
             # 使用openpyxl操作excel
             from openpyxl import Workbook, load_workbook
