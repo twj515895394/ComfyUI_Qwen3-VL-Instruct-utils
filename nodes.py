@@ -15,17 +15,19 @@ import json
 
 class Qwen3_Base:
     """Qwen3节点的基类，包含通用的缓存功能"""
+    # 使用类变量共享模型和处理器
+    _model = None
+    _processor = None
+    _current_model_id = None
+    _current_quantization = None
+    
     def __init__(self):
         self.model_checkpoint = None
-        self.processor = None
-        self.model = None
         self.device = comfy.model_management.get_torch_device()
         self.bf16_support = (
                 torch.cuda.is_available()
                 and torch.cuda.get_device_capability(self.device)[0] >= 8
         )
-        self.current_model_id = None  # Track the current model id
-        self.current_quantization = None  # Track the current quantization
         self.cache = {}  # 用于存储输入参数和模型输出的缓存
         self.max_cache_size = 100  # 最大缓存条目数
         self.cache_enabled = True  # 缓存开关
@@ -190,23 +192,23 @@ class Qwen3_VQA(Qwen3_Base):
 
         # If model_id or quantization changed, reload processor and model
         if (
-                self.current_model_id != model_id
-                or self.current_quantization != quantization
-                or self.processor is None
-                or self.model is None
+                self.__class__._current_model_id != model_id
+                or self.__class__._current_quantization != quantization
+                or self.__class__._processor is None
+                or self.__class__._model is None
         ):
-            self.current_model_id = model_id
-            self.current_quantization = quantization
-            if self.processor is not None:
-                del self.processor
-                self.processor = None
-            if self.model is not None:
-                del self.model
-                self.model = None
+            self.__class__._current_model_id = model_id
+            self.__class__._current_quantization = quantization
+            if self.__class__._processor is not None:
+                del self.__class__._processor
+                self.__class__._processor = None
+            if self.__class__._model is not None:
+                del self.__class__._model
+                self.__class__._model = None
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
-            self.processor = AutoProcessor.from_pretrained(
+            self.__class__._processor = AutoProcessor.from_pretrained(
                 self.model_checkpoint, min_pixels=min_pixels, max_pixels=max_pixels
             )
             if quantization == "4bit":
@@ -220,7 +222,7 @@ class Qwen3_VQA(Qwen3_Base):
             else:
                 quantization_config = None
 
-            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+            self.__class__._model = Qwen3VLForConditionalGeneration.from_pretrained(
                 self.model_checkpoint,
                 dtype=torch.bfloat16 if self.bf16_support else torch.float16,
                 device_map="auto",
@@ -548,23 +550,23 @@ class Qwen3_VQA_Quick(Qwen3_Base):
 
         # If model_id or quantization changed, reload processor and model
         if (
-                self.current_model_id != model_id
-                or self.current_quantization != quantization
-                or self.processor is None
-                or self.model is None
+                self.__class__._current_model_id != model_id
+                or self.__class__._current_quantization != quantization
+                or self.__class__._processor is None
+                or self.__class__._model is None
         ):
-            self.current_model_id = model_id
-            self.current_quantization = quantization
-            if self.processor is not None:
-                del self.processor
-                self.processor = None
-            if self.model is not None:
-                del self.model
-                self.model = None
+            self.__class__._current_model_id = model_id
+            self.__class__._current_quantization = quantization
+            if self.__class__._processor is not None:
+                del self.__class__._processor
+                self.__class__._processor = None
+            if self.__class__._model is not None:
+                del self.__class__._model
+                self.__class__._model = None
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
-            self.processor = AutoProcessor.from_pretrained(
+            self.__class__._processor = AutoProcessor.from_pretrained(
                 self.model_checkpoint, min_pixels=min_pixels, max_pixels=max_pixels
             )
             if quantization == "4bit":
@@ -578,7 +580,7 @@ class Qwen3_VQA_Quick(Qwen3_Base):
             else:
                 quantization_config = None
 
-            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+            self.__class__._model = Qwen3VLForConditionalGeneration.from_pretrained(
                 self.model_checkpoint,
                 dtype=torch.bfloat16 if self.bf16_support else torch.float16,
                 device_map="auto",
@@ -625,14 +627,14 @@ class Qwen3_VQA_Quick(Qwen3_Base):
             prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
             # 处理输入
-            inputs = self.processor(
+            inputs = self.__class__._processor(
                 text=prompt,
                 images=images if images else None,
                 return_tensors="pt",
-            ).to(self.model.device)
+            ).to(self.__class__._model.device)
 
             # 生成回答
-            output_ids = self.model.generate(
+            output_ids = self.__class__._model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
@@ -641,7 +643,7 @@ class Qwen3_VQA_Quick(Qwen3_Base):
 
             # 处理输出
             generated_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, output_ids)]
-            result = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            result = self.__class__._processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
         finally:
             # 清理临时文件
@@ -654,12 +656,14 @@ class Qwen3_VQA_Quick(Qwen3_Base):
 
         # 不保留模型时清理
         if not keep_model_loaded:
-            if self.processor is not None:
-                del self.processor
-                self.processor = None
-            if self.model is not None:
-                del self.model
-                self.model = None
+            if self.__class__._processor is not None:
+                del self.__class__._processor
+                self.__class__._processor = None
+            if self.__class__._model is not None:
+                del self.__class__._model
+                self.__class__._model = None
+            self.__class__._current_model_id = None
+            self.__class__._current_quantization = None
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
