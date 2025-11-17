@@ -89,4 +89,4 @@ Soft Autumn Glow / Cinematic Backlight / Quiet Melancholy / Youth Street Casual�
             - 镜头焦段 + 机位角度
             - 情绪氛围（颗粒度 / 雾化程度 / 色温）
         - 不得重复描述
-        - 不超过 200 字（高密度表达）
+        - 不超过 300 字（高密度表达）
