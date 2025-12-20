@@ -16,7 +16,7 @@ class Qwen3_Text_Excel_Reader:
         return {
             "required": {
                 "file_path": ("STRING", {"default": "", "placeholder": "文件路径 (.txt/.xlsx)"}),
-                "file_format": ("STRING", {"default": "text", "choices": ["text", "excel"]}),
+                "file_format": ("STRING", {"default": "txt", "choices": ["txt", "excel"], "forceInput": False}),
                 "start_line": ("INT", {"default": 1, "min": 1, "max": 10000, "step": 1}),
                 "read_count": ("INT", {"default": -1, "min": -1, "max": 10000, "step": 1}),
                 "excel_sheet": ("STRING", {"default": "Sheet1"}),
@@ -42,7 +42,7 @@ class Qwen3_Text_Excel_Reader:
 
         text_lines = []
 
-        if file_format == "text":
+        if file_format == "txt" or file_format == "text":
             # 读取文本文件
             with open(file_path, "r", encoding="utf-8") as f:
                 # 跳过前 start_line-1 行

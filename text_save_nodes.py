@@ -10,7 +10,7 @@ class Qwen3_Text_Save:
             "required": {
                 "text": ("STRING", {"default": "", "multiline": True}),
                 "file_path": ("STRING", {"default": "", "placeholder": "Enter file path with extension (e.g., output.txt or output.xlsx)\nRelative paths will use ComfyUI output directory as base"}),
-                "file_format": ("STRING", {"default": "txt", "choices": ["txt", "excel"]}),
+                "file_format": ("STRING", {"default": "txt", "choices": ["txt", "excel"], "forceInput": False}),
                 "mode": ("STRING", {"default": "append", "choices": ["append", "write"]}),
             },
             "optional": {
