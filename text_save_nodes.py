@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import folder_paths
 
 class Qwen3_Text_Save:
     @classmethod
@@ -8,7 +9,7 @@ class Qwen3_Text_Save:
         return {
             "required": {
                 "text": ("STRING", {"default": "", "multiline": True}),
-                "file_path": ("STRING", {"default": "", "placeholder": "Enter file path with extension (e.g., output.txt or output.xlsx)"}),
+                "file_path": ("STRING", {"default": "", "placeholder": "Enter file path with extension (e.g., output.txt or output.xlsx)\nRelative paths will use ComfyUI output directory as base"}),
                 "file_format": ("STRING", {"default": "txt", "choices": ["txt", "excel"]}),
                 "mode": ("STRING", {"default": "append", "choices": ["append", "write"]}),
             },
@@ -117,16 +118,41 @@ class Qwen3_Text_Save:
         except Exception as e:
             return f"Error: {str(e)}", file_path
 
+    def process_file_path(self, file_path):
+        """处理文件路径，如果是相对路径则使用ComfyUI的output目录作为基础"""
+        if not file_path:
+            return ""
+        
+        # 获取ComfyUI的output目录
+        output_dir = folder_paths.get_output_directory()
+        
+        # 判断是否为相对路径
+        if os.path.isabs(file_path):
+            # 绝对路径，直接返回
+            return file_path
+        else:
+            # 相对路径，拼接output目录
+            # 清理路径中的..和.以避免路径遍历安全问题
+            safe_path = os.path.normpath(file_path)
+            # 确保不在output目录之外
+            full_path = os.path.join(output_dir, safe_path)
+            return full_path
+
     def save_text(self, text, file_path, file_format, mode, sheet_name="Sheet1"):
         """主保存函数"""
         # 验证文件路径
         if not file_path:
             return "Error: File path is empty", ""
         
+        # 处理路径
+        processed_path = self.process_file_path(file_path)
+        if not processed_path:
+            return "Error: Failed to process file path", ""
+        
         # 根据文件格式选择保存方法
         if file_format == "txt":
-            return self.save_to_txt(file_path, text, mode)
+            return self.save_to_txt(processed_path, text, mode)
         elif file_format == "excel":
-            return self.save_to_excel(file_path, text, mode, sheet_name)
+            return self.save_to_excel(processed_path, text, mode, sheet_name)
         else:
             return "Error: Unsupported file format", file_path
