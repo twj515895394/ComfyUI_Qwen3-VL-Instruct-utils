@@ -16,7 +16,13 @@ class Qwen3_Text_Excel_Reader:
         return {
             "required": {
                 "file_path": ("STRING", {"default": "", "placeholder": "文件路径 (.txt/.xlsx)"}),
-                "file_format": ("STRING", {"default": "txt", "choices": ["txt", "excel"], "forceInput": False}),
+                "file_format": (
+                    [
+                        "txt",   # 文本文件
+                        "excel", # Excel文件
+                    ],
+                    {"default": "txt"}  # 默认txt格式
+                ),
                 "start_line": ("INT", {"default": 1, "min": 1, "max": 10000, "step": 1}),
                 "read_count": ("INT", {"default": -1, "min": -1, "max": 10000, "step": 1}),
                 "excel_sheet": ("STRING", {"default": "Sheet1"}),

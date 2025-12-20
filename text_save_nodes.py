@@ -10,8 +10,20 @@ class Qwen3_Text_Save:
             "required": {
                 "text": ("STRING", {"default": "", "multiline": True}),
                 "file_path": ("STRING", {"default": "", "placeholder": "Enter file path with extension (e.g., output.txt or output.xlsx)\nRelative paths will use ComfyUI output directory as base"}),
-                "file_format": ("STRING", {"default": "txt", "choices": ["txt", "excel"], "forceInput": False}),
-                "mode": ("STRING", {"default": "append", "choices": ["append", "write"], "forceInput": False}),
+                "file_format": (
+                    [
+                        "txt",  # 文本格式
+                        "excel",  # Excel格式
+                    ],
+                    {"default": "txt"}  # 默认txt格式
+                ),
+                "mode": (
+                    [
+                        "append",  # 追加模式
+                        "write",   # 覆盖模式
+                    ],
+                    {"default": "append"}  # 默认追加模式
+                ),
             },
             "optional": {
                 "sheet_name": ("STRING", {"default": "Sheet1"}),
