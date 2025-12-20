@@ -126,14 +126,30 @@ class Qwen3_Text_Save:
         # 获取ComfyUI的output目录
         output_dir = folder_paths.get_output_directory()
         
-        # 判断是否为相对路径
-        if os.path.isabs(file_path):
+        # Windows和Unix风格的绝对路径判断
+        is_absolute = os.path.isabs(file_path)
+        
+        # Windows特殊处理：以斜杠开头的路径（如/文件夹/文件）在Windows中被视为绝对路径
+        # 但用户可能希望这是相对路径，所以特殊处理
+        if file_path.startswith('/') or file_path.startswith('\\'):
+            # 以斜杠开头的路径，视为相对路径
+            is_absolute = False
+        
+        if is_absolute:
             # 绝对路径，直接返回
             return file_path
         else:
             # 相对路径，拼接output目录
             # 清理路径中的..和.以避免路径遍历安全问题
-            safe_path = os.path.normpath(file_path)
+            # 如果原始路径以/或\开头，需要先去除这个前缀
+            if file_path.startswith('/') or file_path.startswith('\\'):
+                # 去除开头的斜杠
+                safe_path = file_path[1:].lstrip('/\\')
+            else:
+                safe_path = file_path
+            
+            # 进一步清理路径中的.和..
+            safe_path = os.path.normpath(safe_path)
             # 确保不在output目录之外
             full_path = os.path.join(output_dir, safe_path)
             return full_path
