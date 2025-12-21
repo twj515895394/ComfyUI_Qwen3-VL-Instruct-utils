@@ -362,11 +362,35 @@ class Qwen3_VQA(Qwen3_Base):
 
                 # 加载模型
                 start_time = time.time()
+                # 智能选择注意力实现：flash_attention_2 → eager
+                actual_attention = attention
+                if attention == "flash_attention_2":
+                    try:
+                        # 尝试使用 flash_attention_2
+                        test_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                            self.model_checkpoint,
+                            dtype=torch.bfloat16 if self.bf16_support else torch.float16,
+                            device_map="cpu",  # 使用CPU测试，避免GPU内存占用
+                            attn_implementation="flash_attention_2",
+                            quantization_config=quantization_config,
+                        )
+                        del test_model  # 测试完成后立即释放
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        actual_attention = "flash_attention_2"
+                        print(f"[{self.__class__.__name__}] FlashAttention2 可用，使用最高效的注意力机制")
+                    except (ImportError, RuntimeError, OSError) as e:
+                        print(f"[{self.__class__.__name__}] FlashAttention2 不可用: {str(e)[:100]}...")
+                        print(f"[{self.__class__.__name__}] 自动降级到标准注意力机制 (eager)")
+                        actual_attention = "eager"
+                else:
+                    print(f"[{self.__class__.__name__}] 使用指定的注意力机制: {attention}")
+                
                 ModelManager._model = Qwen3VLForConditionalGeneration.from_pretrained(
                     self.model_checkpoint,
                     dtype=torch.bfloat16 if self.bf16_support else torch.float16,
                     device_map="auto",
-                    attn_implementation=attention,
+                    attn_implementation=actual_attention,
                     quantization_config=quantization_config,
                 )
                 model_load_time = time.time() - start_time
@@ -830,11 +854,35 @@ class Qwen3_VQA_Quick(Qwen3_Base):
 
                 # 加载模型
                 start_time = time.time()
+                # 智能选择注意力实现：flash_attention_2 → eager
+                actual_attention = attention
+                if attention == "flash_attention_2":
+                    try:
+                        # 尝试使用 flash_attention_2
+                        test_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                            self.model_checkpoint,
+                            dtype=torch.bfloat16 if self.bf16_support else torch.float16,
+                            device_map="cpu",  # 使用CPU测试，避免GPU内存占用
+                            attn_implementation="flash_attention_2",
+                            quantization_config=quantization_config,
+                        )
+                        del test_model  # 测试完成后立即释放
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        actual_attention = "flash_attention_2"
+                        print(f"[{self.__class__.__name__}] FlashAttention2 可用，使用最高效的注意力机制")
+                    except (ImportError, RuntimeError, OSError) as e:
+                        print(f"[{self.__class__.__name__}] FlashAttention2 不可用: {str(e)[:100]}...")
+                        print(f"[{self.__class__.__name__}] 自动降级到标准注意力机制 (eager)")
+                        actual_attention = "eager"
+                else:
+                    print(f"[{self.__class__.__name__}] 使用指定的注意力机制: {attention}")
+                
                 ModelManager._model = Qwen3VLForConditionalGeneration.from_pretrained(
                     self.model_checkpoint,
                     dtype=torch.bfloat16 if self.bf16_support else torch.float16,
                     device_map="auto",
-                    attn_implementation=attention,
+                    attn_implementation=actual_attention,
                     quantization_config=quantization_config,
                 )
                 model_load_time = time.time() - start_time
