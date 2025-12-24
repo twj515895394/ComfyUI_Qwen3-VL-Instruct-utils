@@ -33,27 +33,35 @@ class ModelManager:
         print(f"[ModelManager] 模型引用计数: {cls._reference_count}, 活跃会话: {len(cls._active_sessions)}")
         
     @classmethod
-    def release_model(cls, session_id):
-        """释放模型，减少引用计数"""
+    def release_model(cls, session_id, keep_model_loaded=False):
+        """释放模型，减少引用计数
+        
+        Args:
+            session_id: 会话ID
+            keep_model_loaded: 当前调用是否启用了keep_model_loaded
+        """
         if session_id in cls._active_sessions:
             cls._active_sessions.remove(session_id)
             cls._reference_count = max(0, cls._reference_count - 1)
             print(f"[ModelManager] 模型引用计数: {cls._reference_count}, 活跃会话: {len(cls._active_sessions)}")
             
-            # 修改逻辑：只有在引用计数为0且模型真的需要释放时才释放
-            # 或者在特定条件下延迟释放模型
+            # 只有在引用计数为0时考虑释放模型
             if cls._reference_count == 0:
-                # 检查是否应该延迟释放模型
-                if cls._should_keep_model_loaded():
-                    print(f"[ModelManager] 启用keep_model_loaded，延迟释放模型")
-                    return
-                cls._release_all_resources()
+                # 只有当用户没有开启keep_model_loaded时才释放模型
+                if not keep_model_loaded:
+                    print(f"[ModelManager] 用户未启用keep_model_loaded，释放所有模型资源")
+                    cls._release_all_resources()
+                else:
+                    print(f"[ModelManager] 用户启用keep_model_loaded，保持模型加载状态")
     
     @classmethod
-    def _should_keep_model_loaded(cls):
-        """判断是否应该保持模型加载状态"""
-        # 如果模型已经加载且不是None，说明模型可用
-        return cls._model is not None and cls._processor is not None
+    def _should_keep_model_loaded(cls, keep_model_loaded):
+        """判断是否应该保持模型加载状态
+        
+        Args:
+            keep_model_loaded: 当前调用是否启用了keep_model_loaded
+        """
+        return keep_model_loaded
     
     @classmethod
     def _release_all_resources(cls):
@@ -72,7 +80,8 @@ class ModelManager:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
-    
+        print(f"[ModelManager] 模型资源释放完成，显存已清理")
+
     @classmethod
     def get_model_info(cls):
         """获取当前模型信息"""
@@ -542,7 +551,7 @@ class Qwen3_VQA(Qwen3_Base):
                 
         finally:
             # 减少模型引用计数
-            ModelManager.release_model(self.session_id)
+            ModelManager.release_model(self.session_id, keep_model_loaded)
     
     
 
@@ -1038,3 +1047,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
 # 节点加载成功日志
 print("[ComfyUI_Qwen3-VL-Instruct] 所有节点加载成功")
+
+
