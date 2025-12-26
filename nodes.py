@@ -2,6 +2,7 @@ import os
 import torch
 import time
 import folder_paths
+import random
 from torchvision.transforms import ToPILImage
 from transformers import (
     Qwen3VLForConditionalGeneration,
@@ -12,6 +13,38 @@ import comfy.model_management
 from qwen_vl_utils import process_vision_info
 from pathlib import Path
 import json
+
+
+def validate_seed(seed):
+    """验证和修复seed种子值
+    
+    Args:
+        seed: 输入的种子值
+        
+    Returns:
+        tuple: (修复后的seed值, 是否为随机生成)
+    """
+    import random
+    
+    # 最大种子值 (2^32 - 1)
+    MAX_SEED = 2**32 - 1
+    
+    is_random = False
+    
+    # 处理特殊情况
+    if seed == -1:
+        # seed=-1时生成随机种子
+        seed = random.randint(0, MAX_SEED)
+        is_random = True
+    elif seed > MAX_SEED:
+        # 超过最大值时生成随机种子
+        seed = random.randint(0, MAX_SEED)
+        is_random = True
+    elif seed < 0:
+        # 负值修正为0
+        seed = 0
+    
+    return seed, is_random
 
 
 class ModelManager:
@@ -235,7 +268,7 @@ class Qwen3_VQA(Qwen3_Base):
                         "step": 28 * 28,
                     },
                 ),
-                "seed": ("INT", {"default": -1}),  # add seed parameter, default is -1
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2**63 - 1}),  # add seed parameter, default is -1
                 "attention": (
                     [
                         "eager",
@@ -310,6 +343,11 @@ class Qwen3_VQA(Qwen3_Base):
         ModelManager.acquire_model(self.session_id)
         
         try:
+            # 验证和修复seed值
+            seed, is_random = validate_seed(seed)
+            if is_random:
+                print(f"[{self.__class__.__name__}] 使用修复后的seed值: {seed}")
+                
             if seed != -1:
                 torch.manual_seed(seed)
             if model == "Huihui-Qwen3-VL-8B-Instruct-abliterated":
@@ -631,7 +669,7 @@ class Qwen3_VQA_Quick(Qwen3_Base):
                         "step": 28 * 28,
                     },
                 ),
-                "seed": ("INT", {"default": -1}),  # add seed parameter, default is -1
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2**63 - 1}),  # add seed parameter, default is -1
                 "attention": (
                     [
                         "eager",
@@ -778,6 +816,11 @@ class Qwen3_VQA_Quick(Qwen3_Base):
         ModelManager.acquire_model(self.session_id)
         
         try:
+            # 验证和修复seed值
+            seed, is_random = validate_seed(seed)
+            if is_random:
+                print(f"[{self.__class__.__name__}] 使用修复后的seed值: {seed}")
+                
             if seed != -1:
                 torch.manual_seed(seed)
             if model == "Huihui-Qwen3-VL-8B-Instruct-abliterated":
@@ -1047,5 +1090,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
 # 节点加载成功日志
 print("[ComfyUI_Qwen3-VL-Instruct] 所有节点加载成功")
+
+
+
+
+
 
 

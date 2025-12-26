@@ -4,6 +4,7 @@ import base64
 import time
 import logging
 import numpy as np
+import random
 from PIL import Image
 import io
 from openai import OpenAI
@@ -11,6 +12,36 @@ from openai import OpenAI
 # 设置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# 种子值验证和修复函数
+def validate_seed(seed, allow_random=True):
+    """验证并修复seed值，确保在有效范围内
+    
+    Args:
+        seed: 输入的seed值
+        allow_random: 是否允许生成随机seed
+    Returns:
+        tuple: (修复后的seed值, 是否为随机生成的)
+    """
+    MAX_SEED = 2**32 - 1  # 4294967295
+    
+    if seed == -1 and allow_random:
+        # -1 表示随机生成种子
+        new_seed = random.randint(0, MAX_SEED)
+        logger.info(f"Seed为-1，生成随机种子: {new_seed}")
+        return new_seed, True
+    elif seed > MAX_SEED:
+        # 超出范围，重新生成随机种子
+        new_seed = random.randint(0, MAX_SEED)
+        logger.warning(f"Seed值 {seed} 超出范围 [0, {MAX_SEED}]，重新生成随机种子: {new_seed}")
+        return new_seed, True
+    elif seed < 0:
+        # 负值（非-1），修正为0
+        logger.warning(f"Seed值 {seed} 为负值，修正为: 0")
+        return 0, False
+    else:
+        # 正常范围内的值
+        return seed, False
 
 # 从文件中读取API Key
 
@@ -53,7 +84,7 @@ class Qwen3_VQA_API:
                 "top_p": ("FLOAT", {"default": 0.8, "min": 0, "max": 1, "step": 0.01}),
                 "frequency_penalty": ("FLOAT", {"default": 0, "min": -2, "max": 2, "step": 0.01}),
                 "presence_penalty": ("FLOAT", {"default": 0, "min": -2, "max": 2, "step": 0.01}),
-                "seed": ("INT", {"default": 42, "min": 0, "max": 2**32 - 1}),
+                "seed": ("INT", {"default": 42, "min": -1, "max": 2**63 - 1}),
             },
             "optional": {
                 "image1": ("IMAGE",),
@@ -70,6 +101,11 @@ class Qwen3_VQA_API:
         try:
             start_time = time.time()
             logger.info(f"Starting Qwen3_VQA_API inference with prompt: {prompt[:50]}...")
+            
+            # 验证和修复seed值
+            seed, is_random = validate_seed(seed)
+            if is_random:
+                logger.info(f"使用修复后的seed值: {seed}")
             
             # 获取客户端
             client = get_client()
@@ -176,7 +212,7 @@ class Qwen3_VQA_Quick_API:
                 "top_p": ("FLOAT", {"default": 0.8, "min": 0, "max": 1, "step": 0.01}),
                 "frequency_penalty": ("FLOAT", {"default": 0, "min": -2, "max": 2, "step": 0.01}),
                 "presence_penalty": ("FLOAT", {"default": 0, "min": -2, "max": 2, "step": 0.01}),
-                "seed": ("INT", {"default": 42, "min": 0, "max": 2**32 - 1}),
+                "seed": ("INT", {"default": 42, "min": -1, "max": 2**63 - 1}),
             },
             "optional": {
                 "image1": ("IMAGE",),
@@ -207,6 +243,11 @@ class Qwen3_VQA_Quick_API:
         try:
             start_time = time.time()
             logger.info(f"Starting Qwen3_VQA_Quick_API inference...")
+            
+            # 验证和修复seed值
+            seed, is_random = validate_seed(seed)
+            if is_random:
+                logger.info(f"使用修复后的seed值: {seed}")
             
             # 获取客户端
             client = get_client()
