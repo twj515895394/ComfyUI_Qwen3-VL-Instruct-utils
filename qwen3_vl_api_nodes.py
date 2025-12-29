@@ -23,7 +23,7 @@ def validate_seed(seed, allow_random=True):
     Returns:
         tuple: (修复后的seed值, 是否为随机生成的)
     """
-    MAX_SEED = 2**32 - 1  # 4294967295
+    MAX_SEED = 2**31 - 1  # 2147483647 (32位有符号整数最大值)
     
     if seed == -1 and allow_random:
         # -1 表示随机生成种子
