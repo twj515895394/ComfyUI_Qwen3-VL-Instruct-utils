@@ -27,7 +27,7 @@ def validate_seed(seed):
     import random
     
     # 最大种子值 (2^32 - 1)
-    MAX_SEED = 2**32 - 1
+    MAX_SEED = 2**31 - 1
     
     is_random = False
     
