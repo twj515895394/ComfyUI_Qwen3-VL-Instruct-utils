@@ -3,6 +3,13 @@ import torch
 import time
 import folder_paths
 import random
+import gc
+import io
+import hashlib
+import json
+import base64
+from pathlib import Path
+from PIL import Image
 from torchvision.transforms import ToPILImage
 from transformers import (
     Qwen3VLForConditionalGeneration,
@@ -11,1247 +18,605 @@ from transformers import (
 )
 import comfy.model_management
 from qwen_vl_utils import process_vision_info
-from pathlib import Path
-import json
 
+# ==============================================================================
+# 1. 辅助函数与常量
+# ==============================================================================
 
 def validate_seed(seed):
-    """验证和修复seed种子值
-    
-    Args:
-        seed: 输入的种子值
-        
-    Returns:
-        tuple: (修复后的seed值, 是否为随机生成)
-    """
-    import random
-    
-    # 最大种子值 (2^32 - 1)
+    """验证和修复seed种子值"""
     MAX_SEED = 2**31 - 1
-    
     is_random = False
-    
-    # 处理特殊情况
-    if seed == -1:
-        # seed=-1时生成随机种子
-        seed = random.randint(0, MAX_SEED)
-        is_random = True
-    elif seed > MAX_SEED:
-        # 超过最大值时生成随机种子
+    if seed == -1 or seed > MAX_SEED:
         seed = random.randint(0, MAX_SEED)
         is_random = True
     elif seed < 0:
-        # 负值修正为0
         seed = 0
-    
     return seed, is_random
 
+def get_model_path(model_name):
+    """获取模型路径，优先查找 prompt_generator 目录"""
+    # 优先查找 prompt_generator 目录
+    model_dir = os.path.join(folder_paths.models_dir, "prompt_generator")
+    
+    # 特殊处理 Huihui 模型 - 兼容原始路径
+    if model_name == "Huihui-Qwen3-VL-8B-Instruct-abliterated":
+        huihui_path = f"Y:\\llama-models\\Qwen3-vl-nsfw\\prompt_generator\\Huihui-Qwen3-VL-8B-Instruct-abliterated"
+        if os.path.exists(huihui_path):
+            return huihui_path, os.path.dirname(huihui_path)
+        target_path = os.path.join(model_dir, model_name)
+    else:
+        # 处理 qwen/Qwen3... 格式
+        target_path = os.path.join(model_dir, model_name)
+    
+    # 如果路径不存在，尝试从 HuggingFace 格式推断
+    if not os.path.exists(target_path):
+        # 兼容性处理：如果模型名包含 repo 前缀，取 basename
+        model_base = os.path.basename(model_name)
+        alt_path = os.path.join(model_dir, model_base)
+        if os.path.exists(alt_path):
+            return alt_path, model_dir
+        
+    return target_path, model_dir
 
-class ModelManager:
-    """模型管理器，使用智能缓存管理模型生命周期"""
-    _model = None
-    _processor = None
-    _current_model_id = None
-    _current_quantization = None
-    _reference_count = 0
-    _active_sessions = set()  # 跟踪活跃的节点实例
-    _last_model_id = None  # 保留最后使用的模型ID
-    _last_quantization = None  # 保留最后使用的量化方式
+# ==============================================================================
+# 2. 策略模式: Attention 机制管理
+# ==============================================================================
+
+class AttentionStrategy:
+    """管理不同的 Attention 实现策略"""
     
-    @classmethod
-    def acquire_model(cls, session_id):
-        """获取模型，增加引用计数"""
-        cls._active_sessions.add(session_id)
-        cls._reference_count += 1
-        print(f"[ModelManager] 模型引用计数: {cls._reference_count}, 活跃会话: {len(cls._active_sessions)}")
+    @staticmethod
+    def apply_patch(strategy_name):
+        """应用 Attention Patch (主要是 SageAttention)"""
+        if strategy_name == "sage_attention_2":
+            try:
+                import sageattention
+                from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLAttention, apply_multimodal_rotary_pos_emb
+                
+                print("[AttentionStrategy] 正在应用 SageAttention2 补丁...")
+                
+                def sage_attention_forward(self, hidden_states: torch.Tensor, attention_mask=None, position_ids=None, 
+                                        past_key_values=None, output_attentions: bool = False, use_cache: bool = False, 
+                                        cache_position=None, position_embeddings=None, **kwargs):
+                    bsz, q_len, _ = hidden_states.size()
+                    query_states = self.q_proj(hidden_states)
+                    key_states = self.k_proj(hidden_states)
+                    value_states = self.v_proj(hidden_states)
+                    
+                    query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+                    key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+                    value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+                    
+                    cos, sin = position_embeddings
+                    query_states, key_states = apply_multimodal_rotary_pos_emb(
+                        query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
+                    )
+                    
+                    if past_key_values is not None:
+                        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+                    # NHD Layout for SageAttention
+                    query_states = query_states.transpose(1, 2)
+                    key_states = key_states.transpose(1, 2)
+                    value_states = value_states.transpose(1, 2)
+                    
+                    attn_output = sageattention.sageattn(
+                        query_states, key_states, value_states,
+                        is_causal=self.is_causal, tensor_layout="NHD"
+                    )
+                    
+                    attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, -1).contiguous()
+                    attn_output = self.o_proj(attn_output)
+                    return attn_output, None
+
+                Qwen2VLAttention.forward = sage_attention_forward
+                print("[AttentionStrategy] SageAttention2 补丁应用成功。")
+                return "sdpa" # SageAttn works on top of SDPA base in this context usually
+            except ImportError:
+                print("[AttentionStrategy] 未找到 SageAttention 库。回退到 FlashAttention2。")
+                return "flash_attention_2"
+            except Exception as e:
+                print(f"[AttentionStrategy] SageAttention2 补丁应用失败: {e}。回退到默认设置。")
+                return "eager"
         
+        return strategy_name
+
+    @staticmethod
+    def get_implementation(requested_attention):
+        """获取实际可用的 Attention 实现名称"""
+        if requested_attention == "flash_attention_2":
+            try:
+                import flash_attn
+                return "flash_attention_2"
+            except ImportError:
+                print("[AttentionStrategy] FlashAttention2 不可用。回退到 sdpa。")
+                return "sdpa"
+        if requested_attention == "sage_attention_2":
+             # 如果 patch 没成功（没 return sdpa），这里也会被调用
+             return "sdpa"
+        return requested_attention
+
+# ==============================================================================
+# 3. 单例模式: Model Manager
+# ==============================================================================
+
+class Qwen3ModelManager:
+    """单例类：负责模型的加载、缓存与生命周期管理"""
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(Qwen3ModelManager, cls).__new__(cls)
+            cls._instance._init_resources()
+        return cls._instance
+
+    def _init_resources(self):
+        self.model = None
+        self.processor = None
+        self.current_model_id = None
+        self.current_quantization = None
+        self.current_attention = None
+        self.reference_count = 0
+        self.active_sessions = set()
+        self.device = comfy.model_management.get_torch_device()
+        self.bf16_support = (
+            torch.cuda.is_available() and 
+            torch.cuda.get_device_capability(self.device)[0] >= 8
+        )
+
     @classmethod
-    def release_model(cls, session_id, keep_model_loaded=False):
-        """释放模型，减少引用计数
-        
-        Args:
-            session_id: 会话ID
-            keep_model_loaded: 当前调用是否启用了keep_model_loaded
-        """
-        if session_id in cls._active_sessions:
-            cls._active_sessions.remove(session_id)
-            cls._reference_count = max(0, cls._reference_count - 1)
-            print(f"[ModelManager] 模型引用计数: {cls._reference_count}, 活跃会话: {len(cls._active_sessions)}")
+    def get_instance(cls):
+        if cls._instance is None:
+            cls()
+        return cls._instance
+
+    def acquire(self, session_id):
+        self.active_sessions.add(session_id)
+        self.reference_count += 1
+        # print(f"[ModelManager] Acquire: {self.reference_count} refs")
+
+    def release(self, session_id, keep_loaded=False):
+        if session_id in self.active_sessions:
+            self.active_sessions.remove(session_id)
+            self.reference_count = max(0, self.reference_count - 1)
+            # print(f"[ModelManager] Release: {self.reference_count} refs")
             
-            # 只有在引用计数为0时考虑释放模型
-            if cls._reference_count == 0:
-                # 只有当用户没有开启keep_model_loaded时才释放模型
-                if not keep_model_loaded:
-                    print(f"[ModelManager] 用户未启用keep_model_loaded，释放所有模型资源")
-                    cls._release_all_resources()
-                else:
-                    print(f"[ModelManager] 用户启用keep_model_loaded，保持模型加载状态")
-    
-    @classmethod
-    def _should_keep_model_loaded(cls, keep_model_loaded):
-        """判断是否应该保持模型加载状态
+            if self.reference_count == 0 and not keep_loaded:
+                self.unload_all()
+
+    def unload_all(self):
+        print("[ModelManager] 正在释放模型资源...")
+        if self.model is not None:
+            del self.model
+            self.model = None
+        if self.processor is not None:
+            del self.processor
+            self.processor = None
         
-        Args:
-            keep_model_loaded: 当前调用是否启用了keep_model_loaded
-        """
-        return keep_model_loaded
-    
-    @classmethod
-    def _release_all_resources(cls):
-        """释放所有模型资源"""
-        print(f"[ModelManager] 释放所有模型资源")
-        if cls._model is not None:
-            del cls._model
-            cls._model = None
-        if cls._processor is not None:
-            del cls._processor
-            cls._processor = None
-        # 保留模型ID和量化信息，避免重复加载判断错误
-        # cls._current_model_id = None
-        # cls._current_quantization = None
+        self.current_model_id = None
+        self.current_quantization = None
         
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
-        print(f"[ModelManager] 模型资源释放完成，显存已清理")
+        gc.collect()
+        print("[ModelManager] 模型资源已释放。")
 
-    @classmethod
-    def get_model_info(cls):
-        """获取当前模型信息"""
-        return {
-            'model': cls._model,
-            'processor': cls._processor,
-            'current_model_id': cls._current_model_id,
-            'current_quantization': cls._current_quantization,
-            'reference_count': cls._reference_count,
-            'active_sessions': len(cls._active_sessions)
-        }
+    def load_model(self, model_name, quantization, attention_mode, min_pixels, max_pixels):
+        """加载或重载模型"""
+        # 1. 确定模型ID和路径
+        if model_name == "Huihui-Qwen3-VL-8B-Instruct-abliterated":
+            repo_id = "huihui-ai/Huihui-Qwen3-VL-8B-Instruct-abliterated"
+        else:
+            repo_id = f"qwen/{model_name}"
+            
+        model_path, model_parent_dir = get_model_path(model_name)
+        
+        # 自动下载逻辑
+        if not os.path.exists(model_path):
+            print(f"[ModelManager] 模型未在路径找到: {model_path}。正在下载...")
+            from huggingface_hub import snapshot_download
+            try:
+                snapshot_download(
+                    repo_id=repo_id,
+                    local_dir=model_path,
+                    allow_patterns=["*.json", "*.bin", "*.model", "*.pth", "*.safetensors"],
+                )
+            except Exception as e:
+                print(f"[ModelManager] 下载失败: {e}")
+                raise RuntimeError(f"Could not download model {repo_id}")
 
-class Qwen3_Base:
-    """Qwen3节点的基类，包含通用的缓存功能和模型管理"""
+        # 2. 检查是否需要重新加载
+        # 注意：这里我们加入对 min/max pixels 的检查，因为 processor 需要它们
+        # 但为了避免因为像素参数微调导致重载模型(非常耗时)，我们只在 Processor 层面处理
+        # 真正的重模型加载只看 model_id, quantization, attention
+        
+        actual_attention = AttentionStrategy.apply_patch(attention_mode)
+        actual_attention = AttentionStrategy.get_implementation(actual_attention)
+
+        # 检查是否可以复用模型权重
+        if (self.model is not None and 
+            self.current_model_id == repo_id and 
+            self.current_quantization == quantization and
+            self.current_attention == actual_attention):
+            print("[ModelManager] 复用已加载的模型。")
+            
+            # 即使模型复用，Processor 可能需要更新 min/max pixels
+            # 这是一个轻量级操作，我们总是重新加载 Processor 以确保参数生效
+            # 或者我们可以检查 processor 的配置，但重新加载 Processor 很快 (<1s)
+            self.processor = AutoProcessor.from_pretrained(
+                model_path, min_pixels=min_pixels, max_pixels=max_pixels
+            )
+            return
+
+        # 3. 加载新模型
+        print(f"[ModelManager] 正在加载模型: {repo_id} (Quant: {quantization}, Attn: {actual_attention})")
+        
+        # 卸载旧模型
+        self.unload_all()
+
+        start_time = time.time()
+        
+        # 配置 Quantization
+        bnb_config = None
+        if quantization == "4bit":
+            bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16 if self.bf16_support else torch.float16)
+        elif quantization == "8bit":
+            bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+
+        try:
+            # 加载 Processor
+            self.processor = AutoProcessor.from_pretrained(
+                model_path, min_pixels=min_pixels, max_pixels=max_pixels
+            )
+
+            # 加载 Model
+            # 注意: Qwen3-VL 代码库通常兼容 Qwen2VL 类
+            # 如果 transformers 版本较新，可以直接用 Qwen2VLForConditionalGeneration
+            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+                model_path,
+                torch_dtype=torch.bfloat16 if self.bf16_support else torch.float16,
+                device_map="auto",
+                attn_implementation=actual_attention,
+                quantization_config=bnb_config,
+            )
+            
+            self.current_model_id = repo_id
+            self.current_quantization = quantization
+            self.current_attention = actual_attention
+            
+            print(f"[ModelManager] 模型加载完成，耗时: {time.time() - start_time:.2f}s")
+            
+        except Exception as e:
+            print(f"[ModelManager] 加载错误: {e}")
+            self.unload_all()
+            raise e
+
+# ==============================================================================
+# 4. 模板方法模式: Base Node
+# ==============================================================================
+
+class Qwen3BaseNode:
+    """所有 Qwen3 节点的基类"""
     
     def __init__(self):
-        self.model_checkpoint = None
-        self.device = comfy.model_management.get_torch_device()
-        self.bf16_support = (
-                torch.cuda.is_available()
-                and torch.cuda.get_device_capability(self.device)[0] >= 8
-        )
-        self.cache = {}  # 用于存储输入参数和模型输出的缓存
-        self.max_cache_size = 100  # 最大缓存条目数
-        self.cache_enabled = True  # 缓存开关
-        self.session_id = id(self)  # 唯一会话标识符
-        print(f"[{self.__class__.__name__}] 节点初始化完成，会话ID: {self.session_id}")
-    
-    def _create_cache_key(self, **kwargs):
-        """创建缓存键，基于所有输入参数"""
+        self.session_id = str(id(self))
+        self.cache = {}
+        self.max_cache_size = 50
+        self.manager = Qwen3ModelManager.get_instance()
+
+    def _get_cache_key(self, **kwargs):
+        """生成高效的缓存键"""
         key_parts = []
         for k, v in sorted(kwargs.items()):
-            if v is not None:
-                if isinstance(v, torch.Tensor):
-                    # 对于图像张量，增强缓存键的生成逻辑，添加更多特征信息
-                    try:
-                        # 使用形状、均值、标准差和张量数据的哈希值
-                        # 对于大张量，采样部分数据进行哈希，避免计算开销过大
-                        shape_str = str(v.shape)
-                        mean_val = v.mean().item()
-                        std_val = v.std().item()
-                        
-                        # 采样部分数据计算哈希值（如果张量很大）
-                        if v.numel() > 10000:  # 如果张量元素数量超过10000
-                            # 均匀采样100个点
-                            indices = torch.linspace(0, v.numel() - 1, min(100, v.numel()), dtype=torch.long)
-                            sampled_data = v.view(-1)[indices]
-                            hash_val = hash(str(sampled_data.cpu().numpy().tolist()))
-                        else:
-                            # 对于小张量，使用所有数据的哈希值
-                            hash_val = hash(str(v.cpu().numpy().tolist()))
-                        
-                        key_parts.append(f"{k}:{shape_str}:{mean_val:.4f}:{std_val:.4f}:{hash_val}")
-                    except Exception as e:
-                        # 如果出现异常，降级使用基本信息
-                        print(f"[缓存键生成警告] 处理张量 {k} 时出错: {e}，使用基本信息")
-                        key_parts.append(f"{k}:{v.shape}:{v.mean().item():.4f}:{v.std().item():.4f}")
-                else:
-                    key_parts.append(f"{k}:{v}")
-        
-        # 为了确保缓存键的唯一性和稳定性，添加整体哈希
-        cache_key = "_".join(key_parts)
-        # 如果键太长，使用哈希值缩短
-        if len(cache_key) > 1000:
-            cache_key = f"hash:{hash(cache_key)}"
+            if k == "seed" and v == -1: continue # 忽略随机种子占位符
             
-        return cache_key
-    
-    def generate_cache_key_without_random_seed(self, seed, **kwargs):
-        """生成缓存键，当seed=-1时不包含在缓存键中"""
-        cache_params = dict(kwargs)
-        # 只有当seed不是-1时才将其包含在缓存键中
-        if seed != -1:
-            cache_params['seed'] = seed
+            if isinstance(v, torch.Tensor):
+                # 优化: 仅计算 shape 和少量数据的 hash，避免全量计算
+                meta = f"{v.shape}-{v.device}-{v.dtype}"
+                # 采样中心点
+                if v.numel() > 0:
+                    center_val = v.view(-1)[v.numel() // 2].item()
+                    meta += f"-{center_val:.4f}"
+                key_parts.append(f"{k}:{meta}")
+            else:
+                key_parts.append(f"{k}:{str(v)}")
         
-        return self._create_cache_key(**cache_params)
-    
-    def check_cache(self, cache_key, use_cache=True):
-        """检查缓存是否存在并返回结果"""
-        if use_cache and self.cache_enabled and cache_key in self.cache:
-            print(f"[{self.__class__.__name__}] 缓存命中! 使用缓存结果。")
+        raw_key = "|".join(key_parts)
+        return hashlib.md5(raw_key.encode()).hexdigest()
+
+    def _tensor_to_pil(self, image_tensor):
+        """将 ComfyUI Tensor (B,H,W,C) 转换为 PIL Image 列表"""
+        if image_tensor is None:
+            return []
+        
+        pil_images = []
+        # 遍历 Batch
+        for i in range(image_tensor.shape[0]):
+            img = image_tensor[i] # [H, W, C]
+            # 确保是 CPU
+            img = img.cpu().numpy()
+            # 转换为 PIL (需要先转为 uint8 0-255)
+            img = (img * 255).clip(0, 255).astype("uint8")
+            pil_images.append(Image.fromarray(img))
+        return pil_images
+
+    def _pil_to_base64(self, pil_image):
+        """内存中转换 PIL 为 Base64，避免磁盘 IO"""
+        buffered = io.BytesIO()
+        pil_image.save(buffered, format="PNG")
+        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        return f"data:image/png;base64,{img_str}"
+
+    def inference_template(self, 
+                          prompt_struct_func,  # 回调：构建 prompt 结构
+                          model_name, keep_model_loaded, temperature, max_new_tokens,
+                          min_pixels, max_pixels, seed, quantization, attention,
+                          performance_mode, **kwargs):
+        
+        # 1. 缓存检查
+        cache_key = self._get_cache_key(
+            model=model_name, temp=temperature, tokens=max_new_tokens,
+            min_px=min_pixels, max_px=max_pixels, seed=seed, quant=quantization,
+            attn=attention, perf=performance_mode, **kwargs
+        )
+        if cache_key in self.cache:
+            print(f"[{self.__class__.__name__}] 缓存命中!")
             return self.cache[cache_key]
-        if use_cache and self.cache_enabled:
-            print(f"[{self.__class__.__name__}] 缓存未命中，将请求模型。")
-        return None
-    
-    def update_cache(self, cache_key, result, use_cache=True):
-        """更新缓存"""
-        if use_cache and self.cache_enabled:
-            self.cache[cache_key] = result
-            print(f"[{self.__class__.__name__}] 结果已缓存。当前缓存大小: {len(self.cache)}/{self.max_cache_size}")
-            # 限制缓存大小
+
+        # 2. 资源获取
+        self.manager.acquire(self.session_id)
+        
+        try:
+            # 3. 模型加载
+            self.manager.load_model(model_name, quantization, attention, min_pixels, max_pixels)
+            model = self.manager.model
+            processor = self.manager.processor
+            
+            # 4. 设置随机种子
+            actual_seed, _ = validate_seed(seed)
+            torch.manual_seed(actual_seed)
+
+            # 5. 处理输入并构建 Prompt
+            # kwargs 包含 source_path, images 等
+            messages = prompt_struct_func(**kwargs)
+
+            # 6. 预处理 (Use process_vision_info + apply_chat_template)
+            # 关键优化：process_vision_info 通常需要 path 或者 base64
+            # 我们在 prompt_struct_func 中处理了 Image -> PIL -> Base64/Object 的转换
+            
+            text_prompt = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            
+            image_inputs, video_inputs = process_vision_info(messages)
+            
+            inputs = processor(
+                text=[text_prompt],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+            )
+            inputs = inputs.to(self.manager.device)
+
+            # 7. 生成配置 (Performance Mode)
+            gen_kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "pad_token_id": processor.tokenizer.eos_token_id,
+                "eos_token_id": processor.tokenizer.eos_token_id,
+            }
+            
+            if performance_mode == "speed":
+                # 速度模式：Greedy 或低采样
+                if temperature > 0:
+                    gen_kwargs.update({"do_sample": True, "temperature": temperature, "top_p": 0.8, "top_k": 20})
+                else:
+                    gen_kwargs.update({"do_sample": False})
+            elif performance_mode == "quality":
+                # 质量模式
+                gen_kwargs.update({"do_sample": True, "temperature": max(0.1, temperature), "top_p": 0.95, "top_k": 100})
+            else: # balanced
+                if temperature == 0:
+                    gen_kwargs.update({"do_sample": False})
+                else:
+                    gen_kwargs.update({"do_sample": True, "temperature": temperature, "top_p": 0.9, "top_k": 50})
+
+            # 8. 推理
+            start_t = time.time()
+            with torch.no_grad():
+                generated_ids = model.generate(**inputs, **gen_kwargs)
+            
+            inference_time = time.time() - start_t
+            print(f"[{self.__class__.__name__}] 推理完成，耗时: {inference_time:.2f}s")
+
+            # 9. 解码
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            output_text = processor.batch_decode(
+                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )[0]
+
+            # 10. 缓存与返回
+            # 对于 Qwen3_VQA_Quick，我们可能需要返回 (output, prompt_text)
+            # 这里我们让调用者处理返回值格式，template 返回纯文本
+            
+            self.cache[cache_key] = output_text
             if len(self.cache) > self.max_cache_size:
-                # 删除最早添加的项目
                 self.cache.pop(next(iter(self.cache)))
-                print(f"[{self.__class__.__name__}] 缓存已满，已删除最早的缓存项。")
+            
+            return output_text, text_prompt
+
+        finally:
+            self.manager.release(self.session_id, keep_model_loaded)
 
 
-class Qwen3_VQA(Qwen3_Base):
-    def __init__(self):
-        super().__init__()  # 调用基类的初始化方法
-        print("[Qwen3_VQA] 节点初始化完成，缓存系统已设置")
+# ==============================================================================
+# 5. 具体节点实现
+# ==============================================================================
 
+class Qwen3_VQA(Qwen3BaseNode):
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "text": ("STRING", {"default": "", "multiline": True}),
-                "model": (
-                    [
-                        "Qwen3-VL-4B-Instruct-FP8",
-                        "Qwen3-VL-4B-Thinking-FP8",
-                        "Qwen3-VL-8B-Instruct-FP8",
-                        "Qwen3-VL-8B-Thinking-FP8",
-                        "Qwen3-VL-4B-Instruct",
-                        "Qwen3-VL-4B-Thinking",
-                        "Qwen3-VL-8B-Instruct",
-                        "Qwen3-VL-8B-Thinking",
-                        "Huihui-Qwen3-VL-8B-Instruct-abliterated",
-                    ],
-                    {"default": "Huihui-Qwen3-VL-8B-Instruct-abliterated"},
-                ),
-                "quantization": (
-                    ["none", "4bit", "8bit"],
-                    {"default": "none"},
-                ),  # add quantization type selection
-                "keep_model_loaded": ("BOOLEAN", {"default": False}),
-                "temperature": (
-                    "FLOAT",
-                    {"default": 0.7, "min": 0, "max": 1, "step": 0.1},
-                ),
-                "max_new_tokens": (
-                    "INT",
-                    {"default": 2048, "min": 128, "max": 256000, "step": 1},
-                ),
-                "min_pixels": (
-                    "INT",
-                    {
-                        "default": 256 * 28 * 28,
-                        "min": 4 * 28 * 28,
-                        "max": 16384 * 28 * 28,
-                        "step": 28 * 28,
-                    },
-                ),
-                "max_pixels": (
-                    "INT",
-                    {
-                        "default": 1280 * 28 * 28,
-                        "min": 4 * 28 * 28,
-                        "max": 16384 * 28 * 28,
-                        "step": 28 * 28,
-                    },
-                ),
-                "seed": ("INT", {"default": -1, "min": -1, "max": 2**63 - 1}),  # add seed parameter, default is -1
-                "attention": (
-                    [
-                        "eager",
-                        "sdpa",
-                        "flash_attention_2",
-                        "sage_attention_2",
-                    ],
-                    {"default": "sage_attention_2"},  # 默认使用最高效的注意力机制
-                ),
-                "use_cache": ("BOOLEAN", {"default": True}),  # 缓存开关
-                "performance_mode": (
-                    [
-                        "balanced",  # 平衡模式
-                        "speed",     # 速度优先
-                        "quality",   # 质量优先
-                    ],
-                    {"default": "balanced"},  # 默认平衡模式
-                ),
-                "max_batch_size": (
-                    "INT",
-                    {"default": 1, "min": 1, "max": 8, "step": 1},
-                    {"forceInput": False}
-                ),  # 批处理大小限制
+                "text": ("STRING", {"default": "", "multiline": True, "tooltip": "输入给模型的文本提示词或问题。"}),
+                "model": ([
+                    "Huihui-Qwen3-VL-8B-Instruct-abliterated",
+                    "Qwen3-VL-8B-Instruct", "Qwen3-VL-4B-Instruct",
+                    "Qwen3-VL-8B-Thinking", "Qwen3-VL-4B-Thinking",
+                    "Qwen3-VL-4B-Instruct-FP8", "Qwen3-VL-8B-Instruct-FP8"
+                ], {"default": "Huihui-Qwen3-VL-8B-Instruct-abliterated", "tooltip": "选择要使用的 Qwen3-VL 模型版本。"}),
+                "quantization": (["none", "4bit", "8bit"], {"default": "none", "tooltip": "选择模型量化方式。4bit/8bit 可以显著降低显存占用，但可能略微降低质量。"}),
+                "keep_model_loaded": ("BOOLEAN", {"default": False, "tooltip": "如果开启，模型在推理完成后将保留在显存中，下次运行将非常快。"}),
+                "temperature": ("FLOAT", {"default": 0.7, "min": 0, "max": 1, "step": 0.1, "tooltip": "控制生成文本的随机性。0 为确定性输出，值越高结果越随机。"}),
+                "max_new_tokens": ("INT", {"default": 768, "min": 128, "max": 32000, "tooltip": "限制模型输出的最大文本长度（Token 数量）。值越大生成越慢。"}), 
+                "min_pixels": ("INT", {"default": 256 * 28 * 28, "min": 64*28*28, "tooltip": "处理图片时的最小总像素数（单位：像素点）。"}),
+                "max_pixels": ("INT", {"default": 768 * 28 * 28, "min": 256*28*28, "tooltip": "处理图片时的最大总像素数。超过此值的图片会被自动缩小，这直接影响推理速度和视觉细节。"}), 
+                "seed": ("INT", {"default": -1, "tooltip": "随机种子。-1 表示每次随机生成。"}),
+                "attention": (["sage_attention_2", "flash_attention_2", "sdpa", "eager"], {"default": "sage_attention_2", "tooltip": "选择注意力机制实现。sage_attention_2 通常最快，sdpa 为系统默认优化。"}),
+                "performance_mode": (["balanced", "speed", "quality"], {"default": "balanced", "tooltip": "性能模式预设。speed 优先速度，quality 优先质量。"}),
             },
-            "optional": {"source_path": ("PATH",), "image": ("IMAGE",)},
+            "optional": {
+                "source_path": ("PATH",), 
+                "image": ("IMAGE",)
+            },
         }
 
     RETURN_TYPES = ("STRING",)
-    FUNCTION = "inference"
+    FUNCTION = "run_inference"
     CATEGORY = "Comfyui_Qwen3-VL-Instruct"
 
-    def inference(
-            self,
-            text,
-            model,
-            keep_model_loaded,
-            temperature,
-            max_new_tokens,
-            min_pixels,
-            max_pixels,
-            seed,
-            quantization,
-            source_path=None,
-            image=None,  # add image parameter
-            attention="flash_attention_2",
-            use_cache=True,
-            performance_mode="speed",
-            max_batch_size=1,
-    ):
-        # 使用基类的缓存键生成方法
-        cache_key = self.generate_cache_key_without_random_seed(
-            seed=seed,
-            text=text,
-            model=model,
-            temperature=temperature,
-            max_new_tokens=max_new_tokens,
-            min_pixels=min_pixels,
-            max_pixels=max_pixels,
-            quantization=quantization,
-            source_path=source_path,
-            image=image,
-            attention=attention,
-            performance_mode=performance_mode,
-            max_batch_size=max_batch_size
-        )
+    def run_inference(self, text, model, keep_model_loaded, temperature, max_new_tokens,
+                     min_pixels, max_pixels, seed, quantization, source_path=None, image=None,
+                     attention="sage_attention_2", performance_mode="balanced", **kwargs):
         
-        # 检查是否可以从缓存获取结果
-        cached_result = self.check_cache(cache_key, use_cache)
-        if cached_result is not None:
-            return (cached_result,)
+        def build_prompt(source_path=None, image=None, **kwargs):
+            content = []
             
-        # 增加模型引用计数
-        ModelManager.acquire_model(self.session_id)
-        
-        try:
-            # 验证和修复seed值
-            seed, is_random = validate_seed(seed)
-            if is_random:
-                print(f"[{self.__class__.__name__}] 使用修复后的seed值: {seed}")
-                
-            if seed != -1:
-                torch.manual_seed(seed)
-            if model == "Huihui-Qwen3-VL-8B-Instruct-abliterated":
-                model_id = "huihui-ai/Huihui-Qwen3-VL-8B-Instruct-abliterated"
-            else:
-                model_id = f"qwen/{model}"
-            self.model_checkpoint = f"Y:\\llama-models\\Qwen3-vl-nsfw\\prompt_generator\\Huihui-Qwen3-VL-8B-Instruct-abliterated"
-
-            if not os.path.exists(self.model_checkpoint):
-                from huggingface_hub import snapshot_download
-
-                snapshot_download(
-                    repo_id=model_id,
-                    local_dir=self.model_checkpoint,
-                    allow_patterns=["*.json", "*.bin", "*.model", "*.pth"],
-                    force_download=False,
-                )
-
-            # 获取当前模型状态
-            model_info = ModelManager.get_model_info()
-            print(f"[{self.__class__.__name__}] 当前模型ID: {model_info['current_model_id']}, 目标模型ID: {model_id}")
-            print(f"[{self.__class__.__name__}] 当前量化方式: {model_info['current_quantization']}, 目标量化方式: {quantization}")
-            print(f"[{self.__class__.__name__}] 当前processor状态: {'已加载' if model_info['processor'] is not None else '未加载'}")
-            print(f"[{self.__class__.__name__}] 当前model状态: {'已加载' if model_info['model'] is not None else '未加载'}")
-            
-            if (
-                    model_info['current_model_id'] != model_id
-                    or model_info['current_quantization'] != quantization
-                    or model_info['processor'] is None
-                    or model_info['model'] is None
-            ):
-                print(f"[{self.__class__.__name__}] 模型或处理器需要重新加载")
-                ModelManager._current_model_id = model_id
-                ModelManager._current_quantization = quantization
-                if model_info['processor'] is not None:
-                    del model_info['processor']
-                if model_info['model'] is not None:
-                    del model_info['model']
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.ipc_collect()
-                # 加载处理器
-                start_time = time.time()
-                ModelManager._processor = AutoProcessor.from_pretrained(
-                        self.model_checkpoint, min_pixels=min_pixels, max_pixels=max_pixels
-                    )
-                processor_load_time = time.time() - start_time
-                print(f"[{self.__class__.__name__}] 处理器加载完成，耗时: {processor_load_time:.2f}秒")
-                if quantization == "4bit":
-                    quantization_config = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                    )
-                elif quantization == "8bit":
-                    quantization_config = BitsAndBytesConfig(
-                        load_in_8bit=True,
-                    )
-                else:
-                    quantization_config = None
-
-                # 加载模型
-                start_time = time.time()
-                # 智能选择注意力实现：sage_attention_2 → flash_attention_2 → sdpa → eager
-                actual_attention = attention
-                
-                if attention == "sage_attention_2":
-                    try:
-                        # 尝试导入sageattention库
-                        import sageattention
-                        print(f"[{self.__class__.__name__}] SageAttention2 库已安装，尝试使用SageAttention2")
-                        # SageAttention2通常通过替换transformers中的注意力实现来工作
-                        # 这里我们使用sdpa作为基础，然后应用SageAttention2的优化
-                        actual_attention = "sdpa"
-                        print(f"[{self.__class__.__name__}] SageAttention2 可用，使用最高效的注意力机制")
-                    except ImportError:
-                        print(f"[{self.__class__.__name__}] SageAttention2 库未安装，尝试降级到FlashAttention2")
-                        # 简单检查FlashAttention2是否可用，避免加载测试模型
-                        try:
-                            import flash_attn
-                            # 如果能导入flash_attn，则认为FlashAttention2可用
-                            actual_attention = "flash_attention_2"
-                            print(f"[{self.__class__.__name__}] 降级成功，使用FlashAttention2")
-                        except ImportError:
-                            print(f"[{self.__class__.__name__}] FlashAttention2 不可用，自动降级到标准注意力机制 (eager)")
-                            actual_attention = "eager"
-                elif attention == "flash_attention_2":
-                    # 简单检查FlashAttention2是否可用，避免加载测试模型
-                    try:
-                        import flash_attn
-                        # 如果能导入flash_attn，则认为FlashAttention2可用
-                        actual_attention = "flash_attention_2"
-                        print(f"[{self.__class__.__name__}] FlashAttention2 可用，使用高效的注意力机制")
-                    except ImportError:
-                        print(f"[{self.__class__.__name__}] FlashAttention2 不可用，自动降级到标准注意力机制 (eager)")
-                        actual_attention = "eager"
-                else:
-                    print(f"[{self.__class__.__name__}] 使用指定的注意力机制: {attention}")
-                
-                # 如果选择了SageAttention2且库可用，应用SageAttention2优化
-                if attention == "sage_attention_2" and actual_attention == "sdpa":
-                    try:
-                        import sageattention
-                        # 应用SageAttention2优化 - 使用monkey patching方式
-                        print(f"[{self.__class__.__name__}] 应用SageAttention2优化...")
-                        
-                        # 导入必要的模块
-                        from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLAttention
-                        from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_multimodal_rotary_pos_emb
-                        import torch.nn.functional as F
-                        
-                        # 保存原始的forward方法
-                        original_forward = Qwen2VLAttention.forward
-                        
-                        # 创建使用SageAttention2的新forward方法
-                        def sage_attention_forward(self, 
-                                                hidden_states: torch.Tensor,
-                                                attention_mask = None,
-                                                position_ids = None,
-                                                past_key_values = None,
-                                                output_attentions: bool = False,
-                                                use_cache: bool = False,
-                                                cache_position = None,
-                                                position_embeddings = None,
-                                                **kwargs):
-                            bsz, q_len, _ = hidden_states.size()
-
-                            query_states = self.q_proj(hidden_states)
-                            key_states = self.k_proj(hidden_states)
-                            value_states = self.v_proj(hidden_states)
-
-                            query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-                            key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-                            value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-
-                            cos, sin = position_embeddings
-                            query_states, key_states = apply_multimodal_rotary_pos_emb(
-                                query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
-                            )
-
-                            if past_key_values is not None:
-                                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-                                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-                            # 使用SageAttention2进行注意力计算
-                            # 转换为NHD布局以获得最佳性能: [batch_size, seq_len, num_heads, head_dim]
-                            query_states = query_states.transpose(1, 2)
-                            key_states = key_states.transpose(1, 2)
-                            value_states = value_states.transpose(1, 2)
-                            
-                            attn_output = sageattention.sageattn(
-                                query_states, 
-                                key_states, 
-                                value_states,
-                                is_causal=self.is_causal,
-                                tensor_layout="NHD"  # NHD表示 [batch_size, seq_len, num_heads, head_dim]
-                            )
-
-                            attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, -1).contiguous()
-                            attn_output = self.o_proj(attn_output)
-                            
-                            # 返回与原始forward方法相同格式的输出
-                            attn_weights = None
-                            return attn_output, attn_weights
-                        
-                        # 应用monkey patching
-                        Qwen2VLAttention.forward = sage_attention_forward
-                        print(f"[{self.__class__.__name__}] SageAttention2优化已应用，将使用高效的注意力计算")
-                        
-                    except Exception as e:
-                        print(f"[{self.__class__.__name__}] SageAttention2优化应用失败: {str(e)[:100]}...")
-                        print(f"[{self.__class__.__name__}] 将使用标准注意力机制")
-                
-                ModelManager._model = Qwen3VLForConditionalGeneration.from_pretrained(
-                    self.model_checkpoint,
-                    dtype=torch.bfloat16 if self.bf16_support else torch.float16,
-                    device_map="auto",
-                    attn_implementation=actual_attention,
-                    quantization_config=quantization_config,
-                )
-                model_load_time = time.time() - start_time
-                print(f"[{self.__class__.__name__}] 模型加载完成，耗时: {model_load_time:.2f}秒")
-                print(f"[{self.__class__.__name__}] 模型和处理器加载完成，总耗时: {processor_load_time + model_load_time:.2f}秒")
-            else:
-                print(f"[{self.__class__.__name__}] 复用现有模型和处理器")
-
-            temp_path = None
+            # 处理图像
             if image is not None:
-                pil_image = ToPILImage()(image[0].permute(2, 0, 1))
-                temp_path = Path(folder_paths.temp_directory) / f"temp_image_{seed}.png"
-                pil_image.save(temp_path)
-
-            with torch.no_grad():
-                if source_path:
-                    messages = [
-                        {
-                            "role": "system",
-                            "content": "You are QwenVL, you are a helpful assistant expert in turning images into words.",
-                        },
-                        {
-                            "role": "user",
-                            "content": source_path
-                                       + [
-                                           {"type": "text", "text": text},
-                                       ],
-                        },
-                    ]
-                elif temp_path:
-                    messages = [
-                        {
-                            "role": "system",
-                            "content": "You are QwenVL, you are a helpful assistant expert in turning images into words.",
-                        },
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image", "image": f"file://{temp_path}"},
-                                {"type": "text", "text": text},
-                            ],
-                        },
-                    ]
+                pil_images = self._tensor_to_pil(image)
+                for img in pil_images:
+                    content.append({"type": "image", "image": img})
+            
+            # 处理 Path (假设是视频或图片路径列表)
+            if source_path:
+                # source_path 可能是 list 或 str，这里假设上游传入的是兼容 process_vision_info 的格式
+                if isinstance(source_path, list):
+                    content.extend(source_path)
                 else:
-                    messages = [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": text},
-                            ],
-                        }
-                    ]
+                    # 简单字符串路径
+                    # TODO: 检测是视频还是图片
+                    content.append({"type": "image", "image": source_path})
 
-                # Preparation for inference
-                text = ModelManager._processor.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
-                image_inputs, video_inputs = process_vision_info(messages)
-                inputs = ModelManager._processor(
-                    text=[text],
-                    images=image_inputs,
-                    videos=video_inputs,
-                    padding=True,
-                    return_tensors="pt",
-                )
-                inputs = inputs.to(self.device)
-                # Inference: Generation of the output
-                start_time = time.time()
-                
-                # 根据性能模式智能调整推理参数
-                if performance_mode == "speed":
-                    # 速度优先模式：优化性能但不限制生成长度
-                    if temperature == 0:
-                        # 温度为0时使用贪婪解码，最快
-                        generation_config = {
-                            "max_new_tokens": max_new_tokens,  # 不限制生成长度
-                            "temperature": 0.0,
-                            "do_sample": False,
-                            "pad_token_id": ModelManager._processor.tokenizer.eos_token_id,
-                            "eos_token_id": ModelManager._processor.tokenizer.eos_token_id,
-                        }
-                    else:
-                        # 温度大于0时使用轻量级采样
-                        generation_config = {
-                            "max_new_tokens": max_new_tokens,  # 不限制生成长度
-                            "temperature": temperature,
-                            "do_sample": True,
-                            "top_p": 0.8,  # 降低top_p以减少计算
-                            "top_k": 30,   # 降低top_k以减少计算
-                            "pad_token_id": ModelManager._processor.tokenizer.eos_token_id,
-                            "eos_token_id": ModelManager._processor.tokenizer.eos_token_id,
-                        }
-                elif performance_mode == "quality":
-                    # 质量优先模式：最大化推理质量
-                    generation_config = {
-                        "max_new_tokens": max_new_tokens,
-                        "temperature": temperature,
-                        "do_sample": True,
-                        "top_p": 0.95,  # 提高top_p以获得更多样化的输出
-                        "top_k": 100,   # 增加top_k以获得更多候选
-                        "pad_token_id": ModelManager._processor.tokenizer.eos_token_id,
-                        "eos_token_id": ModelManager._processor.tokenizer.eos_token_id,
-                    }
-                else:  # balanced模式
-                    # 平衡模式：根据温度智能选择解码策略
-                    if temperature == 0:
-                        # 温度为0时使用贪婪解码，更快且确定性
-                        generation_config = {
-                            "max_new_tokens": max_new_tokens,
-                            "temperature": 0.0,
-                            "do_sample": False,
-                            "pad_token_id": ModelManager._processor.tokenizer.eos_token_id,
-                            "eos_token_id": ModelManager._processor.tokenizer.eos_token_id,
-                        }
-                    else:
-                        # 温度大于0时使用采样解码
-                        generation_config = {
-                            "max_new_tokens": max_new_tokens,
-                            "temperature": temperature,
-                            "do_sample": True,
-                            "top_p": 0.9,  # 添加核采样，提高质量
-                            "top_k": 50,   # 限制候选词数量
-                            "pad_token_id": ModelManager._processor.tokenizer.eos_token_id,
-                            "eos_token_id": ModelManager._processor.tokenizer.eos_token_id,
-                        }
-                
-                generated_ids = ModelManager._model.generate(
-                    **inputs,
-                    **generation_config
-                )
-                inference_time = time.time() - start_time
-                print(f"[{self.__class__.__name__}] 推理完成，耗时: {inference_time:.2f}秒")
-                generated_ids_trimmed = [
-                    out_ids[len(in_ids):]
-                    for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-                ]
-                result = ModelManager._processor.batch_decode(
-                    generated_ids_trimmed,
-                    skip_special_tokens=True,
-                    clean_up_tokenization_spaces=False,
-                    temperature=temperature,
-                )
+            content.append({"type": "text", "text": text})
+            
+            return [{"role": "user", "content": content}]
 
-                # 将结果存入缓存
-                self.update_cache(cache_key, result, use_cache)
-                
-                print(f"[Qwen3_VQA] 推理完成")
-                return (result,)
-                
-        finally:
-            # 减少模型引用计数
-            ModelManager.release_model(self.session_id, keep_model_loaded)
-    
-    
+        result_text, _ = self.inference_template(
+            build_prompt, model, keep_model_loaded, temperature, max_new_tokens,
+            min_pixels, max_pixels, seed, quantization, attention, performance_mode,
+            source_path=source_path, image=image
+        )
+        return (result_text,)
 
-
-class Qwen3_VQA_Quick(Qwen3_Base):
+class Qwen3_VQA_Quick(Qwen3BaseNode):
     def __init__(self):
-        super().__init__()  # 调用基类的初始化方法
-        # 提示词模板文件夹路径
+        super().__init__()
         self.prompts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts")
-        # 确保提示词文件夹存在
-        if not os.path.exists(self.prompts_dir):
-            os.makedirs(self.prompts_dir)
 
     @classmethod
     def INPUT_TYPES(s):
-        # 获取提示词模板文件
         prompts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts")
-        if not os.path.exists(prompts_dir):
-            os.makedirs(prompts_dir)
-        
-        # 加载支持的文件类型
         prompt_files = []
         if os.path.exists(prompts_dir):
-            for file in os.listdir(prompts_dir):
-                if file.endswith((".txt", ".md", ".json")):
-                    prompt_files.append(file)
+            prompt_files = [f for f in os.listdir(prompts_dir) if f.endswith((".txt", ".md", ".json"))]
         
         return {
             "required": {
-                "prompt_template": (sorted(prompt_files), {"default": prompt_files[0] if prompt_files else ""}),
-                "model": (
-                    [
-                        "Qwen3-VL-4B-Instruct-FP8",
-                        "Qwen3-VL-4B-Thinking-FP8",
-                        "Qwen3-VL-8B-Instruct-FP8",
-                        "Qwen3-VL-8B-Thinking-FP8",
-                        "Qwen3-VL-4B-Instruct",
-                        "Qwen3-VL-4B-Thinking",
-                        "Qwen3-VL-8B-Instruct",
-                        "Qwen3-VL-8B-Thinking",
-                        "Huihui-Qwen3-VL-8B-Instruct-abliterated",
-                    ],
-                    {"default": "Huihui-Qwen3-VL-8B-Instruct-abliterated"},
-                ),
-                "user_prompt": (
-                    "STRING",
-                    {"default": "", "multiline": True},
-                ),  # 用户输入的辅助提示词
-                "quantization": (
-                    ["none", "4bit", "8bit"],
-                    {"default": "none"},
-                ),  # add quantization type selection
-                "keep_model_loaded": ("BOOLEAN", {"default": False}),
-                "temperature": (
-                    "FLOAT",
-                    {"default": 0.7, "min": 0, "max": 1, "step": 0.1},
-                ),
-                "max_new_tokens": (
-                    "INT",
-                    {"default": 2048, "min": 128, "max": 256000, "step": 1},
-                ),
-                "min_pixels": (
-                    "INT",
-                    {
-                        "default": 256 * 28 * 28,
-                        "min": 4 * 28 * 28,
-                        "max": 16384 * 28 * 28,
-                        "step": 28 * 28,
-                    },
-                ),
-                "max_pixels": (
-                    "INT",
-                    {
-                        "default": 1280 * 28 * 28,
-                        "min": 4 * 28 * 28,
-                        "max": 16384 * 28 * 28,
-                        "step": 28 * 28,
-                    },
-                ),
-                "seed": ("INT", {"default": -1, "min": -1, "max": 2**63 - 1}),  # add seed parameter, default is -1
-                "attention": (
-                    [
-                        "eager",
-                        "sdpa",
-                        "flash_attention_2",
-                        "sage_attention_2",
-                    ],
-                    {"default": "sage_attention_2"},  # 默认使用最高效的注意力机制
-                ),
-                "use_cache": ("BOOLEAN", {"default": True}),  # 缓存开关
-                "performance_mode": (
-                    [
-                        "balanced",  # 平衡模式
-                        "speed",     # 速度优先
-                        "quality",   # 质量优先
-                    ],
-                    {"default": "balanced"},  # 默认平衡模式
-                ),
-                "max_batch_size": (
-                    "INT",
-                    {"default": 1, "min": 1, "max": 8, "step": 1},
-                    {"forceInput": False}
-                ),  # 批处理大小限制
+                "prompt_template": (sorted(prompt_files), {"default": prompt_files[0] if prompt_files else "", "tooltip": "选择提示词模板文件。"}),
+                "model": ([
+                    "Huihui-Qwen3-VL-8B-Instruct-abliterated",
+                    "Qwen3-VL-8B-Instruct", "Qwen3-VL-4B-Instruct",
+                    "Qwen3-VL-8B-Thinking", "Qwen3-VL-4B-Thinking",
+                    "Qwen3-VL-4B-Instruct-FP8", "Qwen3-VL-8B-Instruct-FP8"
+                ], {"default": "Huihui-Qwen3-VL-8B-Instruct-abliterated", "tooltip": "选择要使用的 Qwen3-VL 模型版本。"}),
+                "user_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": "用户输入的辅助提示词，会拼接在模板内容之后。"}),
+                "quantization": (["none", "4bit", "8bit"], {"default": "none", "tooltip": "选择模型量化方式。4bit/8bit 可以显著降低显存占用。"}),
+                "keep_model_loaded": ("BOOLEAN", {"default": False, "tooltip": "如果开启，模型在推理完成后将保留在显存中。"}),
+                "temperature": ("FLOAT", {"default": 0.7, "tooltip": "控制生成文本的随机性。"}),
+                "max_new_tokens": ("INT", {"default": 768, "tooltip": "限制模型输出的最大文本长度。"}),
+                "min_pixels": ("INT", {"default": 256 * 28 * 28, "tooltip": "处理图片时的最小总像素数。"}),
+                "max_pixels": ("INT", {"default": 768 * 28 * 28, "tooltip": "处理图片时的最大总像素数。超过此值的图片会被自动缩小，显著影响速度。"}), # Optimized default
+                "seed": ("INT", {"default": -1, "tooltip": "随机种子。-1 表示每次随机生成。"}),
+                "attention": (["sage_attention_2", "flash_attention_2", "sdpa", "eager"], {"default": "sage_attention_2", "tooltip": "选择注意力机制实现。"}),
+                "performance_mode": (["balanced", "speed", "quality"], {"default": "balanced", "tooltip": "性能模式预设。"}),
             },
             "optional": {
                 "source_path": ("PATH",),
-                "image1": ("IMAGE",),  # 第一个图像输入（首帧）
-                "image2": ("IMAGE",),  # 第二个图像输入（尾帧）
+                "image1": ("IMAGE",),
+                "image2": ("IMAGE",),
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING")  # 增加一个输出，返回实际使用的提示词
+    RETURN_TYPES = ("STRING", "STRING")
     RETURN_NAMES = ("response", "prompt_text")
-    FUNCTION = "inference"
+    FUNCTION = "run_inference"
     CATEGORY = "Comfyui_Qwen3-VL-Instruct"
 
-    def read_prompt_template(self, template_file):
-        """读取提示词模板文件内容"""
-        file_path = os.path.join(self.prompts_dir, template_file)
-        if not os.path.exists(file_path):
-            return ""  # 文件不存在返回空字符串
-        
+    def run_inference(self, prompt_template, model, keep_model_loaded, temperature, max_new_tokens,
+                     min_pixels, max_pixels, seed, quantization, user_prompt="", 
+                     source_path=None, image1=None, image2=None,
+                     attention="sage_attention_2", performance_mode="balanced", **kwargs):
+
+        # 读取模板
+        template_content = ""
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                # 直接读取文件内容，不做特殊解析
-                return f.read()
-        except Exception as e:
-            print(f"读取提示词模板失败: {e}")
-            return ""  # 读取失败返回空字符串
+            with open(os.path.join(self.prompts_dir, prompt_template), 'r', encoding='utf-8') as f:
+                template_content = f.read()
+        except Exception:
+            template_content = ""
 
-    def _create_cache_key(self, **kwargs):
-        """创建缓存键，基于所有输入参数"""
-        key_parts = []
-        for k, v in sorted(kwargs.items()):
-            if v is not None:
-                if isinstance(v, torch.Tensor):
-                    # 对于图像张量，增强缓存键的生成逻辑，添加更多特征信息
-                    try:
-                        # 使用形状、均值、标准差和张量数据的哈希值
-                        # 对于大张量，采样部分数据进行哈希，避免计算开销过大
-                        shape_str = str(v.shape)
-                        mean_val = v.mean().item()
-                        std_val = v.std().item()
-                        
-                        # 采样部分数据计算哈希值（如果张量很大）
-                        if v.numel() > 10000:  # 如果张量元素数量超过10000
-                            # 均匀采样100个点
-                            indices = torch.linspace(0, v.numel() - 1, min(100, v.numel()), dtype=torch.long)
-                            sampled_data = v.view(-1)[indices]
-                            hash_val = hash(str(sampled_data.cpu().numpy().tolist()))
-                        else:
-                            # 对于小张量，使用所有数据的哈希值
-                            hash_val = hash(str(v.cpu().numpy().tolist()))
-                        
-                        key_parts.append(f"{k}:{shape_str}:{mean_val:.4f}:{std_val:.4f}:{hash_val}")
-                    except Exception as e:
-                        # 如果出现异常，降级使用基本信息
-                        print(f"[缓存键生成警告] 处理张量 {k} 时出错: {e}，使用基本信息")
-                        key_parts.append(f"{k}:{v.shape}:{v.mean().item():.4f}:{v.std().item():.4f}")
-                else:
-                    key_parts.append(f"{k}:{v}")
-        
-        # 为了确保缓存键的唯一性和稳定性，添加整体哈希
-        cache_key = "_".join(key_parts)
-        # 如果键太长，使用哈希值缩短
-        if len(cache_key) > 1000:
-            cache_key = f"hash:{hash(cache_key)}"
+        def build_prompt(prompt_template_text=None, user_prompt_text=None, source_path=None, image1=None, image2=None, **kwargs):
+            # 拼接文本
+            final_text = prompt_template_text
+            if user_prompt_text and user_prompt_text.strip():
+                final_text += f"\n\nUser prompt:{user_prompt_text}"
             
-        return cache_key
+            content = []
+            
+            # 处理图片 (内存中转 PIL)
+            images = []
+            if image1 is not None: images.extend(self._tensor_to_pil(image1))
+            if image2 is not None: images.extend(self._tensor_to_pil(image2))
+            
+            for img in images:
+                content.append({"type": "image", "image": img})
 
-    def inference(
-            self,
-            prompt_template,
-            model,
-            keep_model_loaded,
-            temperature,
-            max_new_tokens,
-            min_pixels,
-            max_pixels,
-            seed,
-            quantization,
-            user_prompt="",
-            source_path=None,
-            image1=None,
-            image2=None,
-            attention="flash_attention_2",
-            use_cache=True,
-            performance_mode="speed",
-            max_batch_size=1,
-    ):
-        # 使用基类的缓存键生成方法
-        cache_key = self.generate_cache_key_without_random_seed(
-            seed=seed,
-            prompt_template=prompt_template,
-            user_prompt=user_prompt,
-            model=model,
-            temperature=temperature,
-            max_new_tokens=max_new_tokens,
-            min_pixels=min_pixels,
-            max_pixels=max_pixels,
-            quantization=quantization,
-            source_path=source_path,
-            image1=image1,
-            image2=image2,
-            attention=attention,
-            performance_mode=performance_mode,
-            max_batch_size=max_batch_size
+            if source_path:
+                 if isinstance(source_path, list):
+                    content.extend(source_path)
+                 else:
+                    content.append({"type": "image", "image": source_path})
+
+            content.append({"type": "text", "text": final_text})
+            
+            return [{"role": "user", "content": content}]
+
+        result_text, full_prompt_text = self.inference_template(
+            build_prompt, model, keep_model_loaded, temperature, max_new_tokens,
+            min_pixels, max_pixels, seed, quantization, attention, performance_mode,
+            prompt_template_text=template_content, user_prompt_text=user_prompt,
+            source_path=source_path, image1=image1, image2=image2
         )
         
-        # 检查是否可以从缓存获取结果
-        cached_result = self.check_cache(cache_key, use_cache)
-        if cached_result is not None:
-            result, text = cached_result
-            print(f"[Qwen3_VQA_Quick] 推理完成")
-            return (result, text)
-        
-        # 读取提示词模板内容
-        template_text = self.read_prompt_template(prompt_template)
-        # 拼接用户输入的辅助提示词
-        text = template_text
-        if user_prompt.strip():
-            text += f"\n\nUser prompt:{user_prompt}"
-        
-        # 增加模型引用计数
-        ModelManager.acquire_model(self.session_id)
-        
-        try:
-            # 验证和修复seed值
-            seed, is_random = validate_seed(seed)
-            if is_random:
-                print(f"[{self.__class__.__name__}] 使用修复后的seed值: {seed}")
-                
-            if seed != -1:
-                torch.manual_seed(seed)
-            if model == "Huihui-Qwen3-VL-8B-Instruct-abliterated":
-                model_id = "huihui-ai/Huihui-Qwen3-VL-8B-Instruct-abliterated"
-            else:
-                model_id = f"qwen/{model}"
-            
-            # 这里使用硬编码路径，与原节点保持一致
-            if model == "Huihui-Qwen3-VL-8B-Instruct-abliterated":
-                self.model_checkpoint = f"Y:\\llama-models\\Qwen3-vl-nsfw\\prompt_generator\\Huihui-Qwen3-VL-8B-Instruct-abliterated"
-            else:
-                self.model_checkpoint = os.path.join(
-                    folder_paths.models_dir, "prompt_generator", os.path.basename(model_id)
-                )
+        return (result_text, full_prompt_text)
 
-            if not os.path.exists(self.model_checkpoint):
-                from huggingface_hub import snapshot_download
-
-                snapshot_download(
-                    repo_id=model_id,
-                    local_dir=self.model_checkpoint,
-                    allow_patterns=["*.json", "*.bin", "*.model", "*.pth"],
-                    force_download=False,
-                )
-
-            # 获取当前模型状态
-            model_info = ModelManager.get_model_info()
-            print(f"[{self.__class__.__name__}] 当前模型ID: {model_info['current_model_id']}, 目标模型ID: {model_id}")
-            print(f"[{self.__class__.__name__}] 当前量化方式: {model_info['current_quantization']}, 目标量化方式: {quantization}")
-            print(f"[{self.__class__.__name__}] 当前processor状态: {'已加载' if model_info['processor'] is not None else '未加载'}")
-            print(f"[{self.__class__.__name__}] 当前model状态: {'已加载' if model_info['model'] is not None else '未加载'}")
-            
-            # 智能模型复用逻辑：只有当需要重新加载模型时才释放
-            need_reload = (
-                model_info['current_model_id'] != model_id
-                or model_info['current_quantization'] != quantization
-                or model_info['processor'] is None
-                or model_info['model'] is None
-            )
-            
-            if keep_model_loaded and model_info['model'] is not None and model_info['processor'] is not None:
-                # 如果keep_model_loaded开启且模型已存在，检查是否匹配
-                if (model_info['current_model_id'] == model_id and 
-                    model_info['current_quantization'] == quantization):
-                    print(f"[{self.__class__.__name__}] keep_model_loaded启用，复用现有模型和处理器")
-                    # 更新当前模型信息以保持一致性
-                    ModelManager._current_model_id = model_id
-                    ModelManager._current_quantization = quantization
-                else:
-                    print(f"[{self.__class__.__name__}] keep_model_loaded启用但模型ID不匹配，需要重新加载")
-                    need_reload = True
-            elif need_reload:
-                print(f"[{self.__class__.__name__}] 模型或处理器需要重新加载")
-                # 清理之前的模型资源
-                if model_info['processor'] is not None:
-                    del model_info['processor']
-                if model_info['model'] is not None:
-                    del model_info['model']
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.ipc_collect()
-            
-            if need_reload:
-                ModelManager._current_model_id = model_id
-                ModelManager._current_quantization = quantization
-                # 加载处理器
-                start_time = time.time()
-                ModelManager._processor = AutoProcessor.from_pretrained(
-                    self.model_checkpoint, min_pixels=min_pixels, max_pixels=max_pixels
-                )
-                processor_load_time = time.time() - start_time
-                print(f"[{self.__class__.__name__}] 处理器加载完成，耗时: {processor_load_time:.2f}秒")
-                if quantization == "4bit":
-                    quantization_config = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                    )
-                elif quantization == "8bit":
-                    quantization_config = BitsAndBytesConfig(
-                        load_in_8bit=True,
-                    )
-                else:
-                    quantization_config = None
-
-                # 加载模型
-                start_time = time.time()
-                # 智能选择注意力实现：sage_attention_2 → flash_attention_2 → sdpa → eager
-                actual_attention = attention
-                
-                if attention == "sage_attention_2":
-                    try:
-                        # 尝试导入sageattention库
-                        import sageattention
-                        print(f"[{self.__class__.__name__}] SageAttention2 库已安装，尝试使用SageAttention2")
-                        # SageAttention2通常通过替换transformers中的注意力实现来工作
-                        # 这里我们使用sdpa作为基础，然后应用SageAttention2的优化
-                        actual_attention = "sdpa"
-                        print(f"[{self.__class__.__name__}] SageAttention2 可用，使用最高效的注意力机制")
-                    except ImportError:
-                        print(f"[{self.__class__.__name__}] SageAttention2 库未安装，尝试降级到FlashAttention2")
-                        # 简单检查FlashAttention2是否可用，避免加载测试模型
-                        try:
-                            import flash_attn
-                            # 如果能导入flash_attn，则认为FlashAttention2可用
-                            actual_attention = "flash_attention_2"
-                            print(f"[{self.__class__.__name__}] 降级成功，使用FlashAttention2")
-                        except ImportError:
-                            print(f"[{self.__class__.__name__}] FlashAttention2 不可用，自动降级到标准注意力机制 (eager)")
-                            actual_attention = "eager"
-                elif attention == "flash_attention_2":
-                    # 简单检查FlashAttention2是否可用，避免加载测试模型
-                    try:
-                        import flash_attn
-                        # 如果能导入flash_attn，则认为FlashAttention2可用
-                        actual_attention = "flash_attention_2"
-                        print(f"[{self.__class__.__name__}] FlashAttention2 可用，使用高效的注意力机制")
-                    except ImportError:
-                        print(f"[{self.__class__.__name__}] FlashAttention2 不可用，自动降级到标准注意力机制 (eager)")
-                        actual_attention = "eager"
-                else:
-                    print(f"[{self.__class__.__name__}] 使用指定的注意力机制: {attention}")
-                
-                # 如果选择了SageAttention2且库可用，应用SageAttention2优化
-                if attention == "sage_attention_2" and actual_attention == "sdpa":
-                    try:
-                        import sageattention
-                        # 应用SageAttention2优化 - 使用monkey patching方式
-                        print(f"[{self.__class__.__name__}] 应用SageAttention2优化...")
-                        
-                        # 导入必要的模块
-                        from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLAttention
-                        from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_multimodal_rotary_pos_emb
-                        import torch.nn.functional as F
-                        
-                        # 保存原始的forward方法
-                        original_forward = Qwen2VLAttention.forward
-                        
-                        # 创建使用SageAttention2的新forward方法
-                        def sage_attention_forward(self, 
-                                                hidden_states: torch.Tensor,
-                                                attention_mask = None,
-                                                position_ids = None,
-                                                past_key_values = None,
-                                                output_attentions: bool = False,
-                                                use_cache: bool = False,
-                                                cache_position = None,
-                                                position_embeddings = None,
-                                                **kwargs):
-                            bsz, q_len, _ = hidden_states.size()
-
-                            query_states = self.q_proj(hidden_states)
-                            key_states = self.k_proj(hidden_states)
-                            value_states = self.v_proj(hidden_states)
-
-                            query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-                            key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-                            value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-
-                            cos, sin = position_embeddings
-                            query_states, key_states = apply_multimodal_rotary_pos_emb(
-                                query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
-                            )
-
-                            if past_key_values is not None:
-                                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-                                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-                            # 使用SageAttention2进行注意力计算
-                            # 转换为NHD布局以获得最佳性能: [batch_size, seq_len, num_heads, head_dim]
-                            query_states = query_states.transpose(1, 2)
-                            key_states = key_states.transpose(1, 2)
-                            value_states = value_states.transpose(1, 2)
-                            
-                            attn_output = sageattention.sageattn(
-                                query_states, 
-                                key_states, 
-                                value_states,
-                                is_causal=self.is_causal,
-                                tensor_layout="NHD"  # NHD表示 [batch_size, seq_len, num_heads, head_dim]
-                            )
-
-                            attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, -1).contiguous()
-                            attn_output = self.o_proj(attn_output)
-                            
-                            # 返回与原始forward方法相同格式的输出
-                            attn_weights = None
-                            return attn_output, attn_weights
-                        
-                        # 应用monkey patching
-                        Qwen2VLAttention.forward = sage_attention_forward
-                        print(f"[{self.__class__.__name__}] SageAttention2优化已应用，将使用高效的注意力计算")
-                        
-                    except Exception as e:
-                        print(f"[{self.__class__.__name__}] SageAttention2优化应用失败: {str(e)[:100]}...")
-                        print(f"[{self.__class__.__name__}] 将使用标准注意力机制")
-                
-                ModelManager._model = Qwen3VLForConditionalGeneration.from_pretrained(
-                    self.model_checkpoint,
-                    dtype=torch.bfloat16 if self.bf16_support else torch.float16,
-                    device_map="auto",
-                    attn_implementation=actual_attention,
-                    quantization_config=quantization_config,
-                )
-                model_load_time = time.time() - start_time
-                print(f"[{self.__class__.__name__}] 模型加载完成，耗时: {model_load_time:.2f}秒")
-                print(f"[{self.__class__.__name__}] 模型和处理器加载完成，总耗时: {processor_load_time + model_load_time:.2f}秒")
-            else:
-                print(f"[{self.__class__.__name__}] 复用现有模型和处理器")
-
-            temp_paths = []
-            if image1 is not None:
-                pil_image1 = ToPILImage()(image1[0].permute(2, 0, 1))
-                temp_path1 = Path(folder_paths.temp_directory) / f"temp_image1_{seed}.png"
-                pil_image1.save(temp_path1)
-                temp_paths.append(temp_path1)
-            
-            if image2 is not None:
-                pil_image2 = ToPILImage()(image2[0].permute(2, 0, 1))
-                temp_path2 = Path(folder_paths.temp_directory) / f"temp_image2_{seed}.png"
-                pil_image2.save(temp_path2)
-                temp_paths.append(temp_path2)
-
-            try:
-                # 处理输入图像
-                images = []
-                if image1 is not None:
-                    images.append(pil_image1)
-                if image2 is not None:
-                    images.append(pil_image2)
-
-                # 准备模型输入
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": text},
-                        ]
-                    }
-                ]
-
-                if images:
-                    for img in images:
-                        messages[0]["content"].append({"type": "image"})
-
-                # 生成prompt
-                prompt = ModelManager._processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-                # 处理输入
-                inputs = ModelManager._processor(
-                    text=prompt,
-                    images=images if images else None,
-                    return_tensors="pt",
-                ).to(ModelManager._model.device)
-
-                # 生成回答 - 优化推理配置
-                start_time = time.time()
-                
-                # 根据性能模式智能调整推理参数
-                if performance_mode == "speed":
-                    # 速度优先模式：优化性能但不限制生成长度
-                    if temperature == 0:
-                        # 温度为0时使用贪婪解码，最快
-                        generation_config = {
-                            "max_new_tokens": max_new_tokens,  # 不限制生成长度
-                            "temperature": 0.0,
-                            "do_sample": False,
-                            "pad_token_id": ModelManager._processor.tokenizer.eos_token_id,
-                            "eos_token_id": ModelManager._processor.tokenizer.eos_token_id,
-                        }
-                    else:
-                        # 温度大于0时使用轻量级采样
-                        generation_config = {
-                            "max_new_tokens": max_new_tokens,  # 不限制生成长度
-                            "temperature": temperature,
-                            "do_sample": True,
-                            "top_p": 0.8,  # 降低top_p以减少计算
-                            "top_k": 30,   # 降低top_k以减少计算
-                            "pad_token_id": ModelManager._processor.tokenizer.eos_token_id,
-                            "eos_token_id": ModelManager._processor.tokenizer.eos_token_id,
-                        }
-                elif performance_mode == "quality":
-                    # 质量优先模式：最大化推理质量
-                    generation_config = {
-                        "max_new_tokens": max_new_tokens,
-                        "temperature": temperature,
-                        "do_sample": True,
-                        "top_p": 0.95,  # 提高top_p以获得更多样化的输出
-                        "top_k": 100,   # 增加top_k以获得更多候选
-                        "pad_token_id": ModelManager._processor.tokenizer.eos_token_id,
-                        "eos_token_id": ModelManager._processor.tokenizer.eos_token_id,
-                    }
-                else:  # balanced模式
-                    # 平衡模式：根据温度智能选择解码策略
-                    if temperature == 0:
-                        # 温度为0时使用贪婪解码，更快且确定性
-                        generation_config = {
-                            "max_new_tokens": max_new_tokens,
-                            "temperature": 0.0,
-                            "do_sample": False,
-                            "pad_token_id": ModelManager._processor.tokenizer.eos_token_id,
-                            "eos_token_id": ModelManager._processor.tokenizer.eos_token_id,
-                        }
-                    else:
-                        # 温度大于0时使用采样解码
-                        generation_config = {
-                            "max_new_tokens": max_new_tokens,
-                            "temperature": temperature,
-                            "do_sample": True,
-                            "top_p": 0.9,  # 添加核采样，提高质量
-                            "top_k": 50,   # 限制候选词数量
-                            "pad_token_id": ModelManager._processor.tokenizer.eos_token_id,
-                            "eos_token_id": ModelManager._processor.tokenizer.eos_token_id,
-                        }
-                
-                output_ids = ModelManager._model.generate(
-                    **inputs,
-                    **generation_config
-                )
-                inference_time = time.time() - start_time
-                print(f"[{self.__class__.__name__}] 推理完成，耗时: {inference_time:.2f}秒")
-
-                # 处理输出
-                generated_ids = [output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, output_ids)]
-                result = ModelManager._processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-
-            finally:
-                # 清理临时文件
-                for path in temp_paths:
-                    if os.path.exists(path):
-                        try:
-                            os.remove(path)
-                        except:
-                            pass
-
-            # 将结果存入缓存
-            self.update_cache(cache_key, (result, text), use_cache)
-            
-            print(f"[Qwen3_VQA_Quick] 推理完成")
-            return (result, text)
-            
-        finally:
-            # 减少模型引用计数
-            ModelManager.release_model(self.session_id)
-
+# 注册节点
 NODE_CLASS_MAPPINGS = {
     "Qwen3_VQA": Qwen3_VQA,
     "Qwen3_VQA_Quick": Qwen3_VQA_Quick,
@@ -1261,13 +626,3 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Qwen3_VQA": "Qwen3 VQA",
     "Qwen3_VQA_Quick": "Qwen3 VQA Quick",
 }
-
-# 节点加载成功日志
-print("[ComfyUI_Qwen3-VL-Instruct] 所有节点加载成功")
-
-
-
-
-
-
-
