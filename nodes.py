@@ -274,8 +274,9 @@ class Qwen3_VQA(Qwen3_Base):
                         "eager",
                         "sdpa",
                         "flash_attention_2",
+                        "sage_attention_2",
                     ],
-                    {"default": "flash_attention_2"},  # 默认使用最高效的注意力机制
+                    {"default": "sage_attention_2"},  # 默认使用最高效的注意力机制
                 ),
                 "use_cache": ("BOOLEAN", {"default": True}),  # 缓存开关
                 "performance_mode": (
@@ -409,29 +410,115 @@ class Qwen3_VQA(Qwen3_Base):
 
                 # 加载模型
                 start_time = time.time()
-                # 智能选择注意力实现：flash_attention_2 → eager
+                # 智能选择注意力实现：sage_attention_2 → flash_attention_2 → sdpa → eager
                 actual_attention = attention
-                if attention == "flash_attention_2":
+                
+                if attention == "sage_attention_2":
                     try:
-                        # 尝试使用 flash_attention_2
-                        test_model = Qwen3VLForConditionalGeneration.from_pretrained(
-                            self.model_checkpoint,
-                            dtype=torch.bfloat16 if self.bf16_support else torch.float16,
-                            device_map="cpu",  # 使用CPU测试，避免GPU内存占用
-                            attn_implementation="flash_attention_2",
-                            quantization_config=quantization_config,
-                        )
-                        del test_model  # 测试完成后立即释放
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                        # 尝试导入sageattention库
+                        import sageattention
+                        print(f"[{self.__class__.__name__}] SageAttention2 库已安装，尝试使用SageAttention2")
+                        # SageAttention2通常通过替换transformers中的注意力实现来工作
+                        # 这里我们使用sdpa作为基础，然后应用SageAttention2的优化
+                        actual_attention = "sdpa"
+                        print(f"[{self.__class__.__name__}] SageAttention2 可用，使用最高效的注意力机制")
+                    except ImportError:
+                        print(f"[{self.__class__.__name__}] SageAttention2 库未安装，尝试降级到FlashAttention2")
+                        # 简单检查FlashAttention2是否可用，避免加载测试模型
+                        try:
+                            import flash_attn
+                            # 如果能导入flash_attn，则认为FlashAttention2可用
+                            actual_attention = "flash_attention_2"
+                            print(f"[{self.__class__.__name__}] 降级成功，使用FlashAttention2")
+                        except ImportError:
+                            print(f"[{self.__class__.__name__}] FlashAttention2 不可用，自动降级到标准注意力机制 (eager)")
+                            actual_attention = "eager"
+                elif attention == "flash_attention_2":
+                    # 简单检查FlashAttention2是否可用，避免加载测试模型
+                    try:
+                        import flash_attn
+                        # 如果能导入flash_attn，则认为FlashAttention2可用
                         actual_attention = "flash_attention_2"
-                        print(f"[{self.__class__.__name__}] FlashAttention2 可用，使用最高效的注意力机制")
-                    except (ImportError, RuntimeError, OSError) as e:
-                        print(f"[{self.__class__.__name__}] FlashAttention2 不可用: {str(e)[:100]}...")
-                        print(f"[{self.__class__.__name__}] 自动降级到标准注意力机制 (eager)")
+                        print(f"[{self.__class__.__name__}] FlashAttention2 可用，使用高效的注意力机制")
+                    except ImportError:
+                        print(f"[{self.__class__.__name__}] FlashAttention2 不可用，自动降级到标准注意力机制 (eager)")
                         actual_attention = "eager"
                 else:
                     print(f"[{self.__class__.__name__}] 使用指定的注意力机制: {attention}")
+                
+                # 如果选择了SageAttention2且库可用，应用SageAttention2优化
+                if attention == "sage_attention_2" and actual_attention == "sdpa":
+                    try:
+                        import sageattention
+                        # 应用SageAttention2优化 - 使用monkey patching方式
+                        print(f"[{self.__class__.__name__}] 应用SageAttention2优化...")
+                        
+                        # 导入必要的模块
+                        from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLAttention
+                        from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_multimodal_rotary_pos_emb
+                        import torch.nn.functional as F
+                        
+                        # 保存原始的forward方法
+                        original_forward = Qwen2VLAttention.forward
+                        
+                        # 创建使用SageAttention2的新forward方法
+                        def sage_attention_forward(self, 
+                                                hidden_states: torch.Tensor,
+                                                attention_mask = None,
+                                                position_ids = None,
+                                                past_key_values = None,
+                                                output_attentions: bool = False,
+                                                use_cache: bool = False,
+                                                cache_position = None,
+                                                position_embeddings = None,
+                                                **kwargs):
+                            bsz, q_len, _ = hidden_states.size()
+
+                            query_states = self.q_proj(hidden_states)
+                            key_states = self.k_proj(hidden_states)
+                            value_states = self.v_proj(hidden_states)
+
+                            query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+                            key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+                            value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+
+                            cos, sin = position_embeddings
+                            query_states, key_states = apply_multimodal_rotary_pos_emb(
+                                query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
+                            )
+
+                            if past_key_values is not None:
+                                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
+                                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+                            # 使用SageAttention2进行注意力计算
+                            # 转换为NHD布局以获得最佳性能: [batch_size, seq_len, num_heads, head_dim]
+                            query_states = query_states.transpose(1, 2)
+                            key_states = key_states.transpose(1, 2)
+                            value_states = value_states.transpose(1, 2)
+                            
+                            attn_output = sageattention.sageattn(
+                                query_states, 
+                                key_states, 
+                                value_states,
+                                is_causal=self.is_causal,
+                                tensor_layout="NHD"  # NHD表示 [batch_size, seq_len, num_heads, head_dim]
+                            )
+
+                            attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, -1).contiguous()
+                            attn_output = self.o_proj(attn_output)
+                            
+                            # 返回与原始forward方法相同格式的输出
+                            attn_weights = None
+                            return attn_output, attn_weights
+                        
+                        # 应用monkey patching
+                        Qwen2VLAttention.forward = sage_attention_forward
+                        print(f"[{self.__class__.__name__}] SageAttention2优化已应用，将使用高效的注意力计算")
+                        
+                    except Exception as e:
+                        print(f"[{self.__class__.__name__}] SageAttention2优化应用失败: {str(e)[:100]}...")
+                        print(f"[{self.__class__.__name__}] 将使用标准注意力机制")
                 
                 ModelManager._model = Qwen3VLForConditionalGeneration.from_pretrained(
                     self.model_checkpoint,
@@ -509,11 +596,11 @@ class Qwen3_VQA(Qwen3_Base):
                 
                 # 根据性能模式智能调整推理参数
                 if performance_mode == "speed":
-                    # 速度优先模式：减少推理步骤，优化性能
+                    # 速度优先模式：优化性能但不限制生成长度
                     if temperature == 0:
                         # 温度为0时使用贪婪解码，最快
                         generation_config = {
-                            "max_new_tokens": min(max_new_tokens, 1024),  # 限制生成长度
+                            "max_new_tokens": max_new_tokens,  # 不限制生成长度
                             "temperature": 0.0,
                             "do_sample": False,
                             "pad_token_id": ModelManager._processor.tokenizer.eos_token_id,
@@ -522,7 +609,7 @@ class Qwen3_VQA(Qwen3_Base):
                     else:
                         # 温度大于0时使用轻量级采样
                         generation_config = {
-                            "max_new_tokens": min(max_new_tokens, 1024),  # 限制生成长度
+                            "max_new_tokens": max_new_tokens,  # 不限制生成长度
                             "temperature": temperature,
                             "do_sample": True,
                             "top_p": 0.8,  # 降低top_p以减少计算
@@ -675,8 +762,9 @@ class Qwen3_VQA_Quick(Qwen3_Base):
                         "eager",
                         "sdpa",
                         "flash_attention_2",
+                        "sage_attention_2",
                     ],
-                    {"default": "flash_attention_2"},  # 默认使用最高效的注意力机制
+                    {"default": "sage_attention_2"},  # 默认使用最高效的注意力机制
                 ),
                 "use_cache": ("BOOLEAN", {"default": True}),  # 缓存开关
                 "performance_mode": (
@@ -906,29 +994,115 @@ class Qwen3_VQA_Quick(Qwen3_Base):
 
                 # 加载模型
                 start_time = time.time()
-                # 智能选择注意力实现：flash_attention_2 → eager
+                # 智能选择注意力实现：sage_attention_2 → flash_attention_2 → sdpa → eager
                 actual_attention = attention
-                if attention == "flash_attention_2":
+                
+                if attention == "sage_attention_2":
                     try:
-                        # 尝试使用 flash_attention_2
-                        test_model = Qwen3VLForConditionalGeneration.from_pretrained(
-                            self.model_checkpoint,
-                            dtype=torch.bfloat16 if self.bf16_support else torch.float16,
-                            device_map="cpu",  # 使用CPU测试，避免GPU内存占用
-                            attn_implementation="flash_attention_2",
-                            quantization_config=quantization_config,
-                        )
-                        del test_model  # 测试完成后立即释放
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                        # 尝试导入sageattention库
+                        import sageattention
+                        print(f"[{self.__class__.__name__}] SageAttention2 库已安装，尝试使用SageAttention2")
+                        # SageAttention2通常通过替换transformers中的注意力实现来工作
+                        # 这里我们使用sdpa作为基础，然后应用SageAttention2的优化
+                        actual_attention = "sdpa"
+                        print(f"[{self.__class__.__name__}] SageAttention2 可用，使用最高效的注意力机制")
+                    except ImportError:
+                        print(f"[{self.__class__.__name__}] SageAttention2 库未安装，尝试降级到FlashAttention2")
+                        # 简单检查FlashAttention2是否可用，避免加载测试模型
+                        try:
+                            import flash_attn
+                            # 如果能导入flash_attn，则认为FlashAttention2可用
+                            actual_attention = "flash_attention_2"
+                            print(f"[{self.__class__.__name__}] 降级成功，使用FlashAttention2")
+                        except ImportError:
+                            print(f"[{self.__class__.__name__}] FlashAttention2 不可用，自动降级到标准注意力机制 (eager)")
+                            actual_attention = "eager"
+                elif attention == "flash_attention_2":
+                    # 简单检查FlashAttention2是否可用，避免加载测试模型
+                    try:
+                        import flash_attn
+                        # 如果能导入flash_attn，则认为FlashAttention2可用
                         actual_attention = "flash_attention_2"
-                        print(f"[{self.__class__.__name__}] FlashAttention2 可用，使用最高效的注意力机制")
-                    except (ImportError, RuntimeError, OSError) as e:
-                        print(f"[{self.__class__.__name__}] FlashAttention2 不可用: {str(e)[:100]}...")
-                        print(f"[{self.__class__.__name__}] 自动降级到标准注意力机制 (eager)")
+                        print(f"[{self.__class__.__name__}] FlashAttention2 可用，使用高效的注意力机制")
+                    except ImportError:
+                        print(f"[{self.__class__.__name__}] FlashAttention2 不可用，自动降级到标准注意力机制 (eager)")
                         actual_attention = "eager"
                 else:
                     print(f"[{self.__class__.__name__}] 使用指定的注意力机制: {attention}")
+                
+                # 如果选择了SageAttention2且库可用，应用SageAttention2优化
+                if attention == "sage_attention_2" and actual_attention == "sdpa":
+                    try:
+                        import sageattention
+                        # 应用SageAttention2优化 - 使用monkey patching方式
+                        print(f"[{self.__class__.__name__}] 应用SageAttention2优化...")
+                        
+                        # 导入必要的模块
+                        from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLAttention
+                        from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_multimodal_rotary_pos_emb
+                        import torch.nn.functional as F
+                        
+                        # 保存原始的forward方法
+                        original_forward = Qwen2VLAttention.forward
+                        
+                        # 创建使用SageAttention2的新forward方法
+                        def sage_attention_forward(self, 
+                                                hidden_states: torch.Tensor,
+                                                attention_mask = None,
+                                                position_ids = None,
+                                                past_key_values = None,
+                                                output_attentions: bool = False,
+                                                use_cache: bool = False,
+                                                cache_position = None,
+                                                position_embeddings = None,
+                                                **kwargs):
+                            bsz, q_len, _ = hidden_states.size()
+
+                            query_states = self.q_proj(hidden_states)
+                            key_states = self.k_proj(hidden_states)
+                            value_states = self.v_proj(hidden_states)
+
+                            query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+                            key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+                            value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+
+                            cos, sin = position_embeddings
+                            query_states, key_states = apply_multimodal_rotary_pos_emb(
+                                query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
+                            )
+
+                            if past_key_values is not None:
+                                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
+                                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+                            # 使用SageAttention2进行注意力计算
+                            # 转换为NHD布局以获得最佳性能: [batch_size, seq_len, num_heads, head_dim]
+                            query_states = query_states.transpose(1, 2)
+                            key_states = key_states.transpose(1, 2)
+                            value_states = value_states.transpose(1, 2)
+                            
+                            attn_output = sageattention.sageattn(
+                                query_states, 
+                                key_states, 
+                                value_states,
+                                is_causal=self.is_causal,
+                                tensor_layout="NHD"  # NHD表示 [batch_size, seq_len, num_heads, head_dim]
+                            )
+
+                            attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, -1).contiguous()
+                            attn_output = self.o_proj(attn_output)
+                            
+                            # 返回与原始forward方法相同格式的输出
+                            attn_weights = None
+                            return attn_output, attn_weights
+                        
+                        # 应用monkey patching
+                        Qwen2VLAttention.forward = sage_attention_forward
+                        print(f"[{self.__class__.__name__}] SageAttention2优化已应用，将使用高效的注意力计算")
+                        
+                    except Exception as e:
+                        print(f"[{self.__class__.__name__}] SageAttention2优化应用失败: {str(e)[:100]}...")
+                        print(f"[{self.__class__.__name__}] 将使用标准注意力机制")
                 
                 ModelManager._model = Qwen3VLForConditionalGeneration.from_pretrained(
                     self.model_checkpoint,
@@ -993,11 +1167,11 @@ class Qwen3_VQA_Quick(Qwen3_Base):
                 
                 # 根据性能模式智能调整推理参数
                 if performance_mode == "speed":
-                    # 速度优先模式：减少推理步骤，优化性能
+                    # 速度优先模式：优化性能但不限制生成长度
                     if temperature == 0:
                         # 温度为0时使用贪婪解码，最快
                         generation_config = {
-                            "max_new_tokens": min(max_new_tokens, 1024),  # 限制生成长度
+                            "max_new_tokens": max_new_tokens,  # 不限制生成长度
                             "temperature": 0.0,
                             "do_sample": False,
                             "pad_token_id": ModelManager._processor.tokenizer.eos_token_id,
@@ -1006,7 +1180,7 @@ class Qwen3_VQA_Quick(Qwen3_Base):
                     else:
                         # 温度大于0时使用轻量级采样
                         generation_config = {
-                            "max_new_tokens": min(max_new_tokens, 1024),  # 限制生成长度
+                            "max_new_tokens": max_new_tokens,  # 不限制生成长度
                             "temperature": temperature,
                             "do_sample": True,
                             "top_p": 0.8,  # 降低top_p以减少计算
