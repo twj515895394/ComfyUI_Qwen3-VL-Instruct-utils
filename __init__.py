@@ -1,4 +1,4 @@
-from .nodes import Qwen3_VQA, Qwen3_VQA_Quick
+from .nodes import Qwen3_VQA, Qwen3_VQA_Quick, Qwen3_VQA_Batch
 from .util_nodes import ImageLoader, VideoLoader, VideoLoaderPath
 from .path_nodes import MultiplePathsInput
 from .text_save_nodes import Qwen3_Text_Save
@@ -11,6 +11,7 @@ WEB_DIRECTORY = "./web"
 NODE_CLASS_MAPPINGS = {
     "Qwen3 VQA": Qwen3_VQA,
     "Qwen3 VQA Quick": Qwen3_VQA_Quick,
+    "Qwen3 VQA Batch": Qwen3_VQA_Batch,
     "Qwen3 VQA API": Qwen3_VQA_API,
     "Qwen3 VQA Quick API": Qwen3_VQA_Quick_API,
     "Load Image Advanced": ImageLoader,
@@ -26,6 +27,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Qwen3 VQA": "Qwen3 VQA",
     "Qwen3 VQA Quick": "Qwen3 VQA Quick",
+    "Qwen3 VQA Batch": "Qwen3 VQA Batch",
     "Qwen3 VQA API": "Qwen3 VQA API",
     "Qwen3 VQA Quick API": "Qwen3 VQA Quick API",
     "Load Image Advanced": "Load Image Advanced",
